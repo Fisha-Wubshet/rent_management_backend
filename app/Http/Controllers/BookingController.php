@@ -11,6 +11,7 @@ use App\Services\BookingService;
 use App\Services\AuditLogService;
 use App\Services\PdfService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
 
 class BookingController extends Controller
@@ -118,6 +119,9 @@ class BookingController extends Controller
     {
         $data = $request->validate(['amount' => 'required|numeric|min:0']);
         $booking = $this->authorizedBooking((int) $id);
+        if (in_array($booking->status, ['RETURNED', 'CANCELLED'])) {
+            abort(400, 'Cannot record payment on a booking that is already ' . strtolower($booking->status) . '.');
+        }
         $newTotal = (float) $booking->total_advance_payment + (float) $data['amount'];
         if ($newTotal > (float) $booking->total_agreed_price) {
             abort(400, 'Payment would exceed the total agreed price.');
@@ -132,6 +136,9 @@ class BookingController extends Controller
     {
         $data = $request->validate(['amount' => 'nullable|numeric|min:0', 'securityDeposit' => 'nullable|numeric|min:0']);
         $booking = $this->authorizedBooking((int) $id);
+        if ($booking->status !== 'CONFIRMED') {
+            abort(400, 'Only a CONFIRMED booking can be marked as picked up. Current status: ' . $booking->status . '.');
+        }
         if ($data['amount'] ?? 0) $booking->increment('total_advance_payment', $data['amount']);
         if ($data['securityDeposit'] ?? 0) $booking->update(['security_deposit' => $data['securityDeposit']]);
         $booking->update(['status' => 'PICKED_UP']);
@@ -149,6 +156,9 @@ class BookingController extends Controller
         ]);
 
         $booking = $this->authorizedBooking((int) $id);
+        if ($booking->status !== 'PICKED_UP') {
+            abort(400, 'Only a PICKED_UP booking can be marked as returned. Current status: ' . $booking->status . '.');
+        }
         if ($data['amount'] ?? 0) $booking->increment('total_advance_payment', $data['amount']);
 
         $updates = ['status' => 'RETURNED'];
@@ -179,6 +189,9 @@ class BookingController extends Controller
     public function cancel($id)
     {
         $booking = $this->authorizedBooking((int) $id);
+        if (in_array($booking->status, ['RETURNED', 'CANCELLED'])) {
+            abort(400, 'Booking is already ' . strtolower($booking->status) . ' and cannot be cancelled.');
+        }
         $booking->update(['status' => 'CANCELLED']);
         $user = auth('api')->user();
         $this->audit->log('Booking', $booking->id, 'CANCELLED', $user->email, $booking->shop_id, $booking->branch_id, null, $this->actorName());
@@ -196,10 +209,17 @@ class BookingController extends Controller
             'depositDeduction' => 'nullable|numeric|min:0',
         ]);
 
-        $newBookingDate = $request->input('bookingDate') ?? $booking->booking_date;
-        $newReturnDate  = $request->input('returnDate')  ?? $booking->return_date;
-        $datesChanged   = $request->input('bookingDate') != $booking->booking_date
-                       || $request->input('returnDate')  != $booking->return_date;
+        $existingBookingDate = $booking->booking_date instanceof \Carbon\Carbon
+            ? $booking->booking_date->toDateString()
+            : (string) $booking->booking_date;
+        $existingReturnDate = $booking->return_date instanceof \Carbon\Carbon
+            ? $booking->return_date->toDateString()
+            : (string) $booking->return_date;
+
+        $newBookingDate = $request->input('bookingDate') ?? $existingBookingDate;
+        $newReturnDate  = $request->input('returnDate')  ?? $existingReturnDate;
+        $datesChanged   = ($request->input('bookingDate') !== null && $request->input('bookingDate') !== $existingBookingDate)
+                       || ($request->input('returnDate')  !== null && $request->input('returnDate')  !== $existingReturnDate);
 
         if ($datesChanged) {
             $itemIds = $booking->items->pluck('item_id')->toArray();
@@ -222,8 +242,6 @@ class BookingController extends Controller
             'deposit_deduction'         => $request->input('depositDeduction'),
             'deposit_deduction_reason'  => $request->input('depositDeductionReason'),
         ], fn($v) => !is_null($v));
-        $newBookingDate    = $request->input('bookingDate') ?? $booking->booking_date;
-        $newReturnDate     = $request->input('returnDate')  ?? $booking->return_date;
         $newAgreedPrice    = $request->input('totalAgreedPrice')    ?? $booking->total_agreed_price;
         $newAdvancePayment = $request->input('totalAdvancePayment') ?? $booking->total_advance_payment;
         if ($newBookingDate && $newReturnDate && $newBookingDate > $newReturnDate) {
@@ -235,10 +253,10 @@ class BookingController extends Controller
         $diffs = [];
         if (!is_null($request->input('totalAgreedPrice')) && $request->input('totalAgreedPrice') != $booking->total_agreed_price)
             $diffs[] = "Price: {$booking->total_agreed_price}→{$request->input('totalAgreedPrice')}";
-        if (!is_null($request->input('bookingDate')) && $request->input('bookingDate') != $booking->booking_date)
-            $diffs[] = "Pickup: {$booking->booking_date}→{$request->input('bookingDate')}";
-        if (!is_null($request->input('returnDate')) && $request->input('returnDate') != $booking->return_date)
-            $diffs[] = "Return: {$booking->return_date}→{$request->input('returnDate')}";
+        if (!is_null($request->input('bookingDate')) && $request->input('bookingDate') !== $existingBookingDate)
+            $diffs[] = "Pickup: {$existingBookingDate}→{$request->input('bookingDate')}";
+        if (!is_null($request->input('returnDate')) && $request->input('returnDate') !== $existingReturnDate)
+            $diffs[] = "Return: {$existingReturnDate}→{$request->input('returnDate')}";
         if (!is_null($request->input('firstName')) && $request->input('firstName') !== $booking->first_name)
             $diffs[] = "Name changed";
 
@@ -464,97 +482,116 @@ class BookingController extends Controller
         $booking = $this->authorizedBooking((int) $id)->load('items');
         $user    = $changeUser;
 
-        $bookingDate = $data['newBookingDate'] ?? $booking->booking_date;
-        $returnDate  = $data['newReturnDate']  ?? ($booking->return_date ?? $bookingDate);
-        $datesChanged = $bookingDate !== $booking->booking_date
-                     || $returnDate  !== ($booking->return_date ?? $bookingDate);
+        $existingPickup = $booking->booking_date instanceof \Carbon\Carbon
+            ? $booking->booking_date->toDateString()
+            : (string) $booking->booking_date;
+        $existingReturn = $booking->return_date instanceof \Carbon\Carbon
+            ? $booking->return_date->toDateString()
+            : (string) ($booking->return_date ?? $existingPickup);
 
-        // If dates changed, every item in the new selection must be re-checked (with full qty, no dedup)
-        if ($datesChanged) {
-            $this->bookingService->checkConflicts($data['dressIds'], $bookingDate, $returnDate, $id);
-        }
-
-        // Compute add/remove diffs
-        $currentItems  = BookingItem::where('booking_id', $id)->get();
-        $currentCounts = [];
-        foreach ($currentItems as $bi) {
-            $currentCounts[$bi->item_id] = ($currentCounts[$bi->item_id] ?? 0) + 1;
-        }
-        $newCounts = array_count_values($data['dressIds']);
-        $allIds    = array_unique(array_merge(array_keys($currentCounts), array_keys($newCounts)));
-
-        $addedCounts   = [];
-        $removedCounts = [];
-
-        foreach ($allIds as $itemId) {
-            $curr = $currentCounts[$itemId] ?? 0;
-            $next = $newCounts[$itemId]     ?? 0;
-
-            if ($next > $curr) {
-                if (!$datesChanged) {
-                    // Dates unchanged: check only the additional units being added
-                    $additionalUnits = array_fill(0, $next - $curr, $itemId);
-                    $this->bookingService->checkConflicts($additionalUnits, $bookingDate, $returnDate, $id);
-                }
-                $name = Item::find($itemId)?->name ?? (string) $itemId;
-                for ($i = 0; $i < ($next - $curr); $i++) {
-                    BookingItem::create(['booking_id' => $id, 'item_id' => $itemId]);
-                }
-                $addedCounts[$name] = ($addedCounts[$name] ?? 0) + ($next - $curr);
-            } elseif ($curr > $next) {
-                $name    = Item::find($itemId)?->name ?? (string) $itemId;
-                $records = BookingItem::where('booking_id', $id)->where('item_id', $itemId)->take($curr - $next)->get();
-                foreach ($records as $bi) { $bi->delete(); }
-                $removedCounts[$name] = ($removedCounts[$name] ?? 0) + ($curr - $next);
-            }
-        }
-
-        $formatSummary = fn(array $counts) => implode(', ', array_map(
-            fn($name, $qty) => $qty > 1 ? "{$qty}× {$name}" : $name,
-            array_keys($counts), $counts
-        ));
+        $bookingDate  = $data['newBookingDate'] ?? $existingPickup;
+        $returnDate   = $data['newReturnDate']  ?? $existingReturn;
+        $datesChanged = $bookingDate !== $existingPickup || $returnDate !== $existingReturn;
 
         $newTotalPrice     = $data['newTotalAgreedPrice'] ?? $booking->total_agreed_price;
         $newAdvancePayment = isset($data['newAdvancePaid']) ? (float) $data['newAdvancePaid'] : (float) $booking->total_advance_payment;
-        $additionalPayment = $newAdvancePayment - (float) $booking->total_advance_payment;
 
-        $dateChangeSummary = null;
-        if ($datesChanged) {
-            $dateChangeSummary = "{$booking->booking_date}→{$bookingDate} / {$booking->return_date}→{$returnDate}";
+        if ($newAdvancePayment > (float) $newTotalPrice) {
+            abort(400, 'Advance payment cannot exceed the new total agreed price.');
         }
 
-        BookingChangeLog::create([
-            'booking_id'            => $id,
-            'changed_by_id'         => $user->id,
-            'changed_by_name'       => $user->first_name . ' ' . $user->last_name,
-            'removed_items_summary' => $removedCounts    ? $formatSummary($removedCounts) : null,
-            'added_items_summary'   => $addedCounts      ? $formatSummary($addedCounts)   : null,
-            'old_total_price'       => $booking->total_agreed_price,
-            'new_total_price'       => $newTotalPrice,
-            'new_advance_payment'   => $newAdvancePayment,
-            'additional_payment'    => $additionalPayment,
-            'date_change_summary'   => $dateChangeSummary,
-            'notes'                 => $data['notes'] ?? null,
-            'changed_at'            => now(),
-        ]);
+        $result = DB::transaction(function () use ($data, $id, $booking, $user, $bookingDate, $returnDate, $datesChanged, $existingPickup, $existingReturn, $newTotalPrice, $newAdvancePayment) {
+            // Lock all items in the new selection to prevent concurrent double-booking.
+            $allItemIds = array_unique($data['dressIds']);
+            Item::whereIn('id', $allItemIds)->lockForUpdate()->get();
 
-        $auditParts = [];
-        if ($addedCounts)   $auditParts[] = 'Added: '   . $formatSummary($addedCounts);
-        if ($removedCounts) $auditParts[] = 'Removed: ' . $formatSummary($removedCounts);
-        if ($datesChanged)  $auditParts[] = "Dates: {$dateChangeSummary}";
-        if (isset($data['newTotalAgreedPrice'])) $auditParts[] = "Price: {$booking->total_agreed_price}→{$newTotalPrice}";
-        $this->audit->log('Booking', $booking->id, 'MODIFIED', $user->email, $booking->shop_id, $booking->branch_id, implode('; ', $auditParts) ?: null, $this->actorName());
+            // If dates changed, every item in the new selection must be re-checked (with full qty, no dedup)
+            if ($datesChanged) {
+                $this->bookingService->checkConflicts($data['dressIds'], $bookingDate, $returnDate, $id);
+            }
 
-        $updates = [];
-        if (isset($data['newTotalAgreedPrice'])) $updates['total_agreed_price']    = $newTotalPrice;
-        if (isset($data['newAdvancePaid']))       $updates['total_advance_payment'] = $newAdvancePayment;
-        if ($datesChanged) {
-            $updates['booking_date'] = $bookingDate;
-            $updates['return_date']  = $returnDate;
-        }
-        if ($updates) $booking->update($updates);
+            // Compute add/remove diffs
+            $currentItems  = BookingItem::where('booking_id', $id)->get();
+            $currentCounts = [];
+            foreach ($currentItems as $bi) {
+                $currentCounts[$bi->item_id] = ($currentCounts[$bi->item_id] ?? 0) + 1;
+            }
+            $newCounts = array_count_values($data['dressIds']);
+            $allIds    = array_unique(array_merge(array_keys($currentCounts), array_keys($newCounts)));
 
-        return response()->json($booking->fresh()->load('items.item', 'changeLogs'));
+            $addedCounts   = [];
+            $removedCounts = [];
+
+            foreach ($allIds as $itemId) {
+                $curr = $currentCounts[$itemId] ?? 0;
+                $next = $newCounts[$itemId]     ?? 0;
+
+                if ($next > $curr) {
+                    if (!$datesChanged) {
+                        // Dates unchanged: check only the additional units being added
+                        $additionalUnits = array_fill(0, $next - $curr, $itemId);
+                        $this->bookingService->checkConflicts($additionalUnits, $bookingDate, $returnDate, $id);
+                    }
+                    $name = Item::find($itemId)?->name ?? (string) $itemId;
+                    for ($i = 0; $i < ($next - $curr); $i++) {
+                        BookingItem::create(['booking_id' => $id, 'item_id' => $itemId]);
+                    }
+                    $addedCounts[$name] = ($addedCounts[$name] ?? 0) + ($next - $curr);
+                } elseif ($curr > $next) {
+                    $name    = Item::find($itemId)?->name ?? (string) $itemId;
+                    $records = BookingItem::where('booking_id', $id)->where('item_id', $itemId)->take($curr - $next)->get();
+                    foreach ($records as $bi) { $bi->delete(); }
+                    $removedCounts[$name] = ($removedCounts[$name] ?? 0) + ($curr - $next);
+                }
+            }
+
+            $formatSummary = fn(array $counts) => implode(', ', array_map(
+                fn($name, $qty) => $qty > 1 ? "{$qty}× {$name}" : $name,
+                array_keys($counts), $counts
+            ));
+
+            $additionalPayment = $newAdvancePayment - (float) $booking->total_advance_payment;
+
+            $dateChangeSummary = null;
+            if ($datesChanged) {
+                $dateChangeSummary = "{$existingPickup}→{$bookingDate} / {$existingReturn}→{$returnDate}";
+            }
+
+            BookingChangeLog::create([
+                'booking_id'            => $id,
+                'changed_by_id'         => $user->id,
+                'changed_by_name'       => $user->first_name . ' ' . $user->last_name,
+                'removed_items_summary' => $removedCounts    ? $formatSummary($removedCounts) : null,
+                'added_items_summary'   => $addedCounts      ? $formatSummary($addedCounts)   : null,
+                'old_total_price'       => $booking->total_agreed_price,
+                'new_total_price'       => $newTotalPrice,
+                'new_advance_payment'   => $newAdvancePayment,
+                'additional_payment'    => $additionalPayment,
+                'date_change_summary'   => $dateChangeSummary,
+                'notes'                 => $data['notes'] ?? null,
+                'changed_at'            => now(),
+            ]);
+
+            $auditParts = [];
+            if ($addedCounts)   $auditParts[] = 'Added: '   . $formatSummary($addedCounts);
+            if ($removedCounts) $auditParts[] = 'Removed: ' . $formatSummary($removedCounts);
+            if ($datesChanged)  $auditParts[] = "Dates: {$dateChangeSummary}";
+            if (isset($data['newTotalAgreedPrice'])) $auditParts[] = "Price: {$booking->total_agreed_price}→{$newTotalPrice}";
+            $this->audit->log('Booking', $booking->id, 'MODIFIED', $user->email, $booking->shop_id, $booking->branch_id, implode('; ', $auditParts) ?: null, $this->actorName());
+
+            $updates = [];
+            if (isset($data['newTotalAgreedPrice'])) $updates['total_agreed_price']    = $newTotalPrice;
+            if (isset($data['newAdvancePaid']))       $updates['total_advance_payment'] = $newAdvancePayment;
+            if ($datesChanged) {
+                $updates['booking_date'] = $bookingDate;
+                $updates['return_date']  = $returnDate;
+            }
+            if ($updates) $booking->update($updates);
+
+            return $booking->fresh()->load('items.item', 'changeLogs');
+        });
+
+        return response()->json($result);
     }
 
     public function markItemReturned(Request $request, $itemId)

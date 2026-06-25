@@ -8,6 +8,7 @@ use App\Models\BookingChangeLog;
 use App\Models\Customer;
 use App\Models\Item;
 use App\Models\ItemBlock;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
 
@@ -67,41 +68,47 @@ class BookingService
 
     public function createInvoice(array $data, int $shopId, int $branchId, string $performedBy): Booking
     {
-        $this->checkConflicts(array_column($data['items'], 'itemId'), $data['bookingDate'], $data['returnDate']);
+        return DB::transaction(function () use ($data, $shopId, $branchId, $performedBy) {
+            // Lock all requested items for the duration of this transaction to prevent double-booking.
+            $itemIds = array_unique(array_column($data['items'], 'itemId'));
+            Item::whereIn('id', $itemIds)->lockForUpdate()->get();
 
-        // Auto-create or link customer
-        $customerId = $data['customerId'] ?? null;
-        if (!$customerId && isset($data['phoneNumber'])) {
-            $customer = Customer::firstOrCreate(
-                ['phone_number' => $data['phoneNumber'], 'shop_id' => $shopId],
-                ['first_name' => $data['firstName'], 'last_name' => $data['lastName'], 'shop_id' => $shopId]
-            );
-            $customerId = $customer->id;
-        }
+            $this->checkConflicts(array_column($data['items'], 'itemId'), $data['bookingDate'], $data['returnDate']);
 
-        $booking = Booking::create([
-            'invoice_number' => $this->generateInvoiceNumber(),
-            'booking_date' => $data['bookingDate'],
-            'return_date' => $data['returnDate'],
-            'first_name' => $data['firstName'],
-            'last_name' => $data['lastName'],
-            'phone_number' => $data['phoneNumber'],
-            'alt_phone_number' => $data['altPhoneNumber'] ?? null,
-            'booking_type' => $data['bookingType'] ?? 'CUSTOMER',
-            'status' => 'CONFIRMED',
-            'customer_id' => $customerId,
-            'total_agreed_price' => $data['totalAgreedPrice'],
-            'total_advance_payment' => $data['totalAdvancePayment'] ?? 0,
-            'security_deposit' => $data['securityDeposit'] ?? 0,
-            'shop_id' => $shopId,
-            'branch_id' => $branchId,
-        ]);
+            // Auto-create or link customer
+            $customerId = $data['customerId'] ?? null;
+            if (!$customerId && isset($data['phoneNumber'])) {
+                $customer = Customer::firstOrCreate(
+                    ['phone_number' => $data['phoneNumber'], 'shop_id' => $shopId],
+                    ['first_name' => $data['firstName'], 'last_name' => $data['lastName'], 'shop_id' => $shopId]
+                );
+                $customerId = $customer->id;
+            }
 
-        foreach ($data['items'] as $item) {
-            BookingItem::create(['booking_id' => $booking->id, 'item_id' => $item['itemId']]);
-        }
+            $booking = Booking::create([
+                'invoice_number' => $this->generateInvoiceNumber(),
+                'booking_date' => $data['bookingDate'],
+                'return_date' => $data['returnDate'],
+                'first_name' => $data['firstName'],
+                'last_name' => $data['lastName'],
+                'phone_number' => $data['phoneNumber'],
+                'alt_phone_number' => $data['altPhoneNumber'] ?? null,
+                'booking_type' => $data['bookingType'] ?? 'CUSTOMER',
+                'status' => 'CONFIRMED',
+                'customer_id' => $customerId,
+                'total_agreed_price' => $data['totalAgreedPrice'],
+                'total_advance_payment' => $data['totalAdvancePayment'] ?? 0,
+                'security_deposit' => $data['securityDeposit'] ?? 0,
+                'shop_id' => $shopId,
+                'branch_id' => $branchId,
+            ]);
 
-        $this->audit->log('Booking', $booking->id, 'CREATED', $performedBy, $shopId, $branchId, "Invoice: {$booking->invoice_number}");
-        return $booking->load('items.item', 'customer', 'branch');
+            foreach ($data['items'] as $item) {
+                BookingItem::create(['booking_id' => $booking->id, 'item_id' => $item['itemId']]);
+            }
+
+            $this->audit->log('Booking', $booking->id, 'CREATED', $performedBy, $shopId, $branchId, "Invoice: {$booking->invoice_number}");
+            return $booking->load('items.item', 'customer', 'branch');
+        });
     }
 }
