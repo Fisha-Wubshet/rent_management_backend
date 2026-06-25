@@ -71,7 +71,8 @@ class ReportController extends Controller
 
     public function revenueTrend(Request $request)
     {
-        $months = $request->months ?? 6;
+        $request->validate(['months' => 'nullable|integer|min:1|max:24']);
+        $months = (int) ($request->months ?? 6);
         $shopId = $this->shopId();
         $results = [];
         for ($i = $months - 1; $i >= 0; $i--) {

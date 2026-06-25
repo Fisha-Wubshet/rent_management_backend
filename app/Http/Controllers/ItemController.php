@@ -9,6 +9,7 @@ use App\Models\ItemBlock;
 use App\Services\AuditLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Carbon\Carbon;
 
 class ItemController extends Controller
 {
@@ -90,8 +91,14 @@ class ItemController extends Controller
             ->whereHas('booking', fn($q) => $q->where('status', 'PICKED_UP'))
             ->count();
 
+        // Apply the same cleaning-gap expansion used in dashboard() and checkConflicts()
+        // so this view shows consistent availability with the booking flow.
+        $checkDate = $item->has_cleaning_gap
+            ? Carbon::today()->subDay()->toDateString()
+            : today()->toDateString();
+
         $blockedUnits = (int) ItemBlock::where('item_id', $id)
-            ->where('end_date', '>=', today()->toDateString())
+            ->where('end_date', '>=', $checkDate)
             ->sum('quantity');
 
         $availableUnits = max(0, $item->quantity - $confirmedUnits - $pickedUpUnits - $blockedUnits);

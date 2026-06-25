@@ -378,7 +378,7 @@ class BookingController extends Controller
         $data = $request->validate([
             'dressId'   => 'required|integer',
             'startDate' => 'required|date',
-            'endDate'   => 'required|date',
+            'endDate'   => 'required|date|after_or_equal:startDate',
             'quantity'  => 'nullable|integer|min:1',
             'reason'    => 'nullable|string|max:255',
         ]);
@@ -433,7 +433,12 @@ class BookingController extends Controller
     public function makeAvailable(Request $request)
     {
         $data = $request->validate(['dressId' => 'required|integer', 'startDate' => 'required|date', 'endDate' => 'required|date']);
-        ItemBlock::where('item_id', $data['dressId'])
+        $user   = auth('api')->user();
+        $shopId = $user->shop_id ?? $user->branch->shop_id;
+        $item   = Item::whereHas('branch', fn($q) => $q->where('shop_id', $shopId))
+            ->where('id', $data['dressId'])
+            ->firstOrFail();
+        ItemBlock::where('item_id', $item->id)
             ->where('start_date', $data['startDate'])
             ->where('end_date', $data['endDate'])
             ->delete();
@@ -597,6 +602,9 @@ class BookingController extends Controller
     public function markItemReturned(Request $request, $itemId)
     {
         $bi = $this->authorizedBookingItem((int) $itemId);
+        if (!in_array($bi->booking->status, ['PICKED_UP', 'RETURNED'])) {
+            abort(400, 'Cannot mark an item as returned on a booking with status: ' . $bi->booking->status . '.');
+        }
         $bi->update(['is_returned' => true]);
         return response()->json(['message' => 'Item marked as returned.']);
     }
@@ -623,9 +631,14 @@ class BookingController extends Controller
 
     public function historyByCode(Request $request, $code)
     {
-        $item = Item::where('unique_code', $code)->firstOrFail();
+        $user   = auth('api')->user();
+        $shopId = $user->shop_id ?? $user->branch->shop_id;
+        $item   = Item::whereHas('branch', fn($q) => $q->where('shop_id', $shopId))
+            ->where('unique_code', $code)
+            ->firstOrFail();
         return response()->json(
             Booking::whereHas('items', fn($q) => $q->where('item_id', $item->id))
+                ->where('shop_id', $shopId)
                 ->with('items.item', 'customer')
                 ->orderByDesc('id')
                 ->paginate($request->size ?? 20)

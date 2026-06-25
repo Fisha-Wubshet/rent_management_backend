@@ -18,10 +18,13 @@ class BookingService
 
     public function generateInvoiceNumber(): string
     {
-        do {
+        for ($i = 0; $i < 10; $i++) {
             $number = 'REF-' . strtoupper(Str::random(8));
-        } while (Booking::where('invoice_number', $number)->exists());
-        return $number;
+            if (!Booking::where('invoice_number', $number)->exists()) {
+                return $number;
+            }
+        }
+        throw new \RuntimeException('Could not generate a unique invoice number after 10 attempts.');
     }
 
     public function checkConflicts(array $itemIds, string $bookingDate, string $returnDate, ?int $excludeBookingId = null): void
