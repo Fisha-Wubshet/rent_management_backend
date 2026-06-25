@@ -195,6 +195,19 @@ class BookingController extends Controller
             'totalAdvancePayment' => 'nullable|numeric|min:0',
             'depositDeduction' => 'nullable|numeric|min:0',
         ]);
+
+        $newBookingDate = $request->input('bookingDate') ?? $booking->booking_date;
+        $newReturnDate  = $request->input('returnDate')  ?? $booking->return_date;
+        $datesChanged   = $request->input('bookingDate') != $booking->booking_date
+                       || $request->input('returnDate')  != $booking->return_date;
+
+        if ($datesChanged) {
+            $itemIds = $booking->items->pluck('item_id')->toArray();
+            if (!empty($itemIds)) {
+                $this->bookingService->checkConflicts($itemIds, $newBookingDate, $newReturnDate, (int) $id);
+            }
+        }
+
         $fields = array_filter([
             'first_name'                => $request->input('firstName'),
             'last_name'                 => $request->input('lastName'),
@@ -246,59 +259,62 @@ class BookingController extends Controller
         $return           = $request->returnDate ?? $pickup;
         $excludeBookingId = $request->excludeBookingId;
 
-        $items = Item::where('branch_id', $branchId)->with([
-            'bookingItems' => function ($q) use ($pickup, $return, $excludeBookingId) {
-                $q->whereHas('booking', function ($bq) use ($pickup, $return, $excludeBookingId) {
+        // Load items with category only; availability is computed per-item below
+        // so that the cleaning-gap expansion is applied correctly per item.
+        $items = Item::where('branch_id', $branchId)->with('category')->get();
+
+        return response()->json($items->map(function ($item) use ($pickup, $return, $excludeBookingId) {
+            // Expand the check window by 1 day on each side for items that need a cleaning gap.
+            $checkStart = $item->has_cleaning_gap
+                ? Carbon::parse($pickup)->subDay()->toDateString()
+                : $pickup;
+            $checkEnd = $item->has_cleaning_gap
+                ? Carbon::parse($return)->addDay()->toDateString()
+                : $return;
+
+            $bookingItems = BookingItem::where('item_id', $item->id)
+                ->whereHas('booking', function ($bq) use ($checkStart, $checkEnd, $excludeBookingId) {
                     $bq->where(function ($sq) {
                             $sq->whereNull('status')->orWhereNotIn('status', ['CANCELLED', 'RETURNED']);
                         })
-                        ->where(function ($bqd) use ($return) {
-                            $bqd->whereNull('booking_date')
-                                ->orWhereDate('booking_date', '<=', $return);
-                        })
-                        ->where(function ($rq) use ($pickup) {
+                        ->whereDate('booking_date', '<=', $checkEnd)
+                        ->where(function ($rq) use ($checkStart) {
                             $rq->whereNull('return_date')
-                               ->orWhereDate('return_date', '>=', $pickup);
+                               ->orWhereDate('return_date', '>=', $checkStart);
                         });
-                    if ($excludeBookingId) {
-                        $bq->where('id', '!=', $excludeBookingId);
-                    }
-                })->with('booking.customer');
-            },
-            'itemBlocks' => function ($q) use ($pickup, $return) {
-                $q->where('start_date', '<=', $return)
-                  ->where('end_date', '>=', $pickup);
-            },
-            'category',
-        ])->get();
+                    if ($excludeBookingId) $bq->where('id', '!=', $excludeBookingId);
+                })
+                ->with('booking.customer')
+                ->get();
 
-        return response()->json($items->map(function ($item) {
-            $activeBookingItems = $item->bookingItems;
-            $blockedCount   = (int) $item->itemBlocks->sum('quantity');
-            $bookedCount    = $activeBookingItems->count() + $blockedCount;
+            $blockedCount   = (int) ItemBlock::where('item_id', $item->id)
+                ->where('start_date', '<=', $checkEnd)
+                ->where('end_date',   '>=', $checkStart)
+                ->sum('quantity');
+
+            $bookedCount    = $bookingItems->count() + $blockedCount;
             $availableCount = max(0, $item->quantity - $bookedCount);
 
-            $firstBooking = $activeBookingItems->first()?->booking;
-            $bookingDetails = $firstBooking ? [
-                'customerName'  => $firstBooking->first_name . ' ' . $firstBooking->last_name,
-                'phone_number'  => $firstBooking->phone_number,
-                'booking_date'  => $firstBooking->booking_date,
-                'return_date'   => $firstBooking->return_date,
-                'invoice_number'=> $firstBooking->invoice_number,
-                'status'        => $firstBooking->status,
-            ] : null;
+            $firstBooking   = $bookingItems->first()?->booking;
 
             return [
-                'itemId'        => $item->id,
-                'unique_code'   => $item->unique_code,
-                'itemName'      => $item->name,
-                'minPrice'      => (float) $item->min_price,
-                'category'      => $item->category?->name,
-                'quantity'      => $item->quantity,
+                'itemId'         => $item->id,
+                'unique_code'    => $item->unique_code,
+                'itemName'       => $item->name,
+                'minPrice'       => (float) $item->min_price,
+                'category'       => $item->category?->name,
+                'quantity'       => $item->quantity,
                 'availableUnits' => $availableCount,
                 'bookedCount'    => $bookedCount,
-                'status'        => $availableCount > 0 ? 'AVAILABLE' : 'BOOKED',
-                'bookingDetails'=> $bookingDetails,
+                'status'         => $availableCount > 0 ? 'AVAILABLE' : 'BOOKED',
+                'bookingDetails' => $firstBooking ? [
+                    'customerName'   => $firstBooking->first_name . ' ' . $firstBooking->last_name,
+                    'phone_number'   => $firstBooking->phone_number,
+                    'booking_date'   => $firstBooking->booking_date,
+                    'return_date'    => $firstBooking->return_date,
+                    'invoice_number' => $firstBooking->invoice_number,
+                    'status'         => $firstBooking->status,
+                ] : null,
             ];
         }));
     }
