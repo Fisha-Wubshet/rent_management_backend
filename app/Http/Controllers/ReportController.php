@@ -37,17 +37,18 @@ class ReportController extends Controller
 
     public function dailyRevenue(Request $request)
     {
-        $request->validate(['date' => 'required|date']);
+        $request->validate(['date' => 'nullable|date']);
+        $date  = $request->date ?? today()->toDateString();
         $query = Booking::where('shop_id', $this->shopId())
-            ->where('booking_date', $request->date)
+            ->where('booking_date', $date)
             ->where('status', '!=', 'CANCELLED');
         if ($request->branchId) $query->where('branch_id', $request->branchId);
         $bookings = $query->get();
         return response()->json([
-            'date'          => $request->date,
-            'totalRevenue'  => (float) $bookings->sum('total_agreed_price'),
+            'date'             => $date,
+            'totalRevenue'     => (float) $bookings->sum('total_agreed_price'),
             'totalOutstanding' => (float) ($bookings->sum('total_agreed_price') - $bookings->sum('total_advance_payment')),
-            'totalBookings' => $bookings->count(),
+            'totalBookings'    => $bookings->count(),
         ]);
     }
 
