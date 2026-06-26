@@ -80,10 +80,21 @@ class CustomerController extends Controller
     public function update(Request $request, $id)
     {
         $customer = Customer::where('shop_id', $this->shopId())->findOrFail($id);
-        $request->validate([
-            'phone_number' => ['nullable', 'string', Rule::unique('customers', 'phone_number')->where('shop_id', $this->shopId())->ignore($customer->id)],
+        $data = $request->validate([
+            'firstName'      => 'nullable|string',
+            'lastName'       => 'nullable|string',
+            'phoneNumber'    => ['nullable', 'string', Rule::unique('customers', 'phone_number')->where('shop_id', $this->shopId())->ignore($customer->id)],
+            'altPhoneNumber' => 'nullable|string',
+            'notes'          => 'nullable|string',
         ]);
-        $customer->update($request->only(['first_name', 'last_name', 'phone_number', 'alt_phone_number', 'notes']));
+        $fields = array_filter([
+            'first_name'       => $data['firstName']      ?? null,
+            'last_name'        => $data['lastName']       ?? null,
+            'phone_number'     => $data['phoneNumber']    ?? null,
+            'alt_phone_number' => $data['altPhoneNumber'] ?? null,
+            'notes'            => $data['notes']          ?? null,
+        ], fn($v) => !is_null($v));
+        $customer->update($fields);
         $this->audit->log('Customer', $customer->id, 'UPDATED', auth('api')->user()->email, $this->shopId(), null, "{$customer->first_name} {$customer->last_name}", $this->actorName());
         return response()->json($customer->fresh());
     }
