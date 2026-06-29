@@ -572,10 +572,8 @@ class BookingController extends Controller
             $allItemIds = array_unique($data['dressIds']);
             Item::whereIn('id', $allItemIds)->lockForUpdate()->get();
 
-            // If dates changed, every item in the new selection must be re-checked (with full qty, no dedup)
-            if ($datesChanged) {
-                $this->bookingService->checkConflicts($data['dressIds'], $bookingDate, $returnDate, $id);
-            }
+            // Always check the full new selection against other bookings (excluding current).
+            $this->bookingService->checkConflicts($data['dressIds'], $bookingDate, $returnDate, $id);
 
             // Compute add/remove diffs
             $currentItems  = BookingItem::where('booking_id', $id)->get();
@@ -594,11 +592,6 @@ class BookingController extends Controller
                 $next = $newCounts[$itemId]     ?? 0;
 
                 if ($next > $curr) {
-                    if (!$datesChanged) {
-                        // Dates unchanged: check only the additional units being added
-                        $additionalUnits = array_fill(0, $next - $curr, $itemId);
-                        $this->bookingService->checkConflicts($additionalUnits, $bookingDate, $returnDate, $id);
-                    }
                     $name = Item::find($itemId)?->name ?? (string) $itemId;
                     for ($i = 0; $i < ($next - $curr); $i++) {
                         BookingItem::create(['booking_id' => $id, 'item_id' => $itemId]);
