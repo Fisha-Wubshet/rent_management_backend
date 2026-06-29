@@ -52,18 +52,20 @@ class BookingController extends Controller
         $dateRule = $user->hasRole('ROLE_STAFF') ? 'required|date|after_or_equal:today' : 'required|date';
 
         $data = $request->validate([
-            'firstName'           => 'required|string',
-            'lastName'            => 'required|string',
-            'phoneNumber'         => 'required|string',
-            'altPhoneNumber'      => 'nullable|string',
-            'bookingDate'         => $dateRule,
-            'returnDate'          => 'required|date|after_or_equal:bookingDate',
-            'customerId'          => 'nullable|integer',
-            'totalAgreedPrice'    => 'required|numeric|min:0',
-            'totalAdvancePayment' => 'nullable|numeric|min:0',
-            'securityDeposit'     => 'nullable|numeric|min:0',
-            'itemIds'             => 'required|array|min:1',
-            'itemIds.*'           => 'required|integer',
+            'firstName'                => 'required|string',
+            'lastName'                 => 'required|string',
+            'phoneNumber'              => 'required|string',
+            'altPhoneNumber'           => 'nullable|string',
+            'bookingDate'              => $dateRule,
+            'returnDate'               => 'required|date|after_or_equal:bookingDate',
+            'customerId'               => 'nullable|integer',
+            'totalAgreedPrice'         => 'required|numeric|min:0',
+            'totalAdvancePayment'      => 'nullable|numeric|min:0',
+            'securityDeposit'          => 'nullable|numeric|min:0',
+            'itemIds'                  => 'required|array|min:1',
+            'itemIds.*'                => 'required|integer',
+            'bypassCleaningGapItemIds' => 'nullable|array',
+            'bypassCleaningGapItemIds.*' => 'integer',
         ]);
 
         if (($data['totalAdvancePayment'] ?? 0) > $data['totalAgreedPrice']) {
@@ -161,7 +163,13 @@ class BookingController extends Controller
         }
         if ($data['amount'] ?? 0) $booking->increment('total_advance_payment', $data['amount']);
 
+        $bookingStart = $booking->booking_date instanceof \Carbon\Carbon
+            ? $booking->booking_date
+            : Carbon::parse($booking->booking_date);
         $updates = ['status' => 'RETURNED'];
+        if (Carbon::today()->gte($bookingStart)) {
+            $updates['return_date'] = Carbon::today()->toDateString();
+        }
 
         if (($booking->security_deposit ?? 0) > 0) {
             $deduction = isset($data['depositDeduction'])
@@ -183,6 +191,35 @@ class BookingController extends Controller
             if (!empty($data['depositDeductionReason'])) $depositNote .= " ({$data['depositDeductionReason']})";
         }
         $this->audit->log('Booking', $booking->id, 'RETURNED', $user->email, $booking->shop_id, $booking->branch_id, $depositNote, $this->actorName());
+        return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
+    }
+
+    public function releaseCleaning(Request $request, $id)
+    {
+        $data    = $request->validate([
+            'releases'           => 'required|array|min:1',
+            'releases.*.itemId'  => 'required|integer',
+            'releases.*.count'   => 'required|integer|min:1',
+        ]);
+        $booking = $this->authorizedBooking((int) $id);
+        if ($booking->status !== 'RETURNED') {
+            abort(400, 'Cleaning gap can only be released for a RETURNED booking.');
+        }
+
+        $releasedSummary = [];
+        foreach ($data['releases'] as $rel) {
+            $ids = BookingItem::where('booking_id', $booking->id)
+                ->where('item_id', $rel['itemId'])
+                ->where('cleaning_gap_released', false)
+                ->limit($rel['count'])
+                ->pluck('id');
+            BookingItem::whereIn('id', $ids)->update(['cleaning_gap_released' => true]);
+            $name = \App\Models\Item::find($rel['itemId'])?->name ?? (string) $rel['itemId'];
+            $releasedSummary[] = "{$rel['count']}× {$name}";
+        }
+
+        $user = auth('api')->user();
+        $this->audit->log('Booking', $booking->id, 'CLEANING_RELEASED', $user->email, $booking->shop_id, $booking->branch_id, implode(', ', $releasedSummary), $this->actorName());
         return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
@@ -313,19 +350,44 @@ class BookingController extends Controller
             $bookedCount    = $bookingItems->count() + $blockedCount;
             $availableCount = max(0, $item->quantity - $bookedCount);
 
-            $firstBooking   = $bookingItems->first()?->booking;
+            // Compute cleaning units: RETURNED booking-items whose cleaning window overlaps the requested dates.
+            $cleaningUnits = 0;
+            if ($item->has_cleaning_gap) {
+                try {
+                    $cleaningUnits = BookingItem::where('item_id', $item->id)
+                        ->where('cleaning_gap_released', false)
+                        ->whereHas('booking', function ($q) use ($checkStart, $return) {
+                            $q->where('status', 'RETURNED')
+                              ->whereDate('return_date', '>=', $checkStart)
+                              ->whereDate('return_date', '<=', $return);
+                        })
+                        ->count();
+                } catch (\Exception $e) {
+                    $cleaningUnits = 0;
+                }
+            }
+
+            // For display purposes, cleaning units reduce the visible available count.
+            $displayAvailable = max(0, $availableCount - $cleaningUnits);
+            $status = $displayAvailable > 0 ? 'AVAILABLE'
+                    : ($cleaningUnits   > 0 ? 'CLEANING' : 'BOOKED');
+
+            $firstBooking = $bookingItems->first()?->booking;
 
             return [
-                'itemId'         => $item->id,
-                'unique_code'    => $item->unique_code,
-                'itemName'       => $item->name,
-                'minPrice'       => (float) $item->min_price,
-                'category'       => $item->category?->name,
-                'quantity'       => $item->quantity,
-                'availableUnits' => $availableCount,
-                'bookedCount'    => $bookedCount,
-                'status'         => $availableCount > 0 ? 'AVAILABLE' : 'BOOKED',
-                'bookingDetails' => $firstBooking ? [
+                'itemId'          => $item->id,
+                'unique_code'     => $item->unique_code,
+                'itemName'        => $item->name,
+                'minPrice'        => (float) $item->min_price,
+                'category'        => $item->category?->name,
+                'quantity'        => $item->quantity,
+                'availableUnits'  => $displayAvailable,
+                'bookedCount'     => $bookedCount,
+                'cleaningUnits'   => $cleaningUnits,
+                'has_cleaning_gap' => (bool) $item->has_cleaning_gap,
+                'image_url'       => $item->image_url,
+                'status'          => $status,
+                'bookingDetails'  => $firstBooking ? [
                     'customerName'   => $firstBooking->first_name . ' ' . $firstBooking->last_name,
                     'phone_number'   => $firstBooking->phone_number,
                     'booking_date'   => $firstBooking->booking_date,

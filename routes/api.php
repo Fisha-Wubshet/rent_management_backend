@@ -99,6 +99,7 @@ Route::middleware('jwt.auth')->group(function () {
         Route::post('/bookings/{id}/pay', [BookingController::class, 'payDue']);
         Route::post('/bookings/{id}/pickup', [BookingController::class, 'pickup']);
         Route::post('/bookings/{id}/complete-return', [BookingController::class, 'completeReturn']);
+        Route::post('/bookings/{id}/release-cleaning', [BookingController::class, 'releaseCleaning']);
         Route::get('/bookings/{id}/invoice/pdf', [BookingController::class, 'downloadInvoicePdf']);
         Route::get('/bookings/{id}/change-logs', [BookingController::class, 'changeLogs']);
         Route::patch('/bookings/{id}/change-items', [BookingController::class, 'changeItems']);

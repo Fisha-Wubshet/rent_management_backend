@@ -180,7 +180,7 @@ class ItemController extends Controller
         $request->validate(['image' => 'required|image|max:5120']);
         $item = $this->authorizedItem((int) $id);
         $path = $request->file('image')->store('items', 'public');
-        $item->update(['image_url' => Storage::url($path)]);
+        $item->update(['image_url' => '/storage/' . $path]);
         return response()->json(['imageUrl' => $item->image_url]);
     }
 }

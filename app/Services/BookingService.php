@@ -27,19 +27,28 @@ class BookingService
         throw new \RuntimeException('Could not generate a unique invoice number after 10 attempts.');
     }
 
-    public function checkConflicts(array $itemIds, string $bookingDate, string $returnDate, ?int $excludeBookingId = null): void
-    {
-        // Count how many units of each item are requested (duplicates = multiple units)
+    /**
+     * @param array $bypassCleaningGapItemIds Item IDs for which the 1-day cleaning buffer should be ignored.
+     */
+    public function checkConflicts(
+        array $itemIds,
+        string $bookingDate,
+        string $returnDate,
+        ?int $excludeBookingId = null,
+        array $bypassCleaningGapItemIds = []
+    ): void {
         $requestedCounts = array_count_values(array_map('intval', $itemIds));
 
         foreach ($requestedCounts as $itemId => $requestedQty) {
-            $item = Item::findOrFail($itemId);
-            $checkStart = $bookingDate;
-            $checkEnd   = $returnDate;
-            if ($item->has_cleaning_gap) {
-                $checkStart = Carbon::parse($bookingDate)->subDay()->toDateString();
-                $checkEnd   = Carbon::parse($returnDate)->addDay()->toDateString();
-            }
+            $item   = Item::findOrFail($itemId);
+            $bypass = in_array($itemId, $bypassCleaningGapItemIds);
+
+            $checkStart = (!$bypass && $item->has_cleaning_gap)
+                ? Carbon::parse($bookingDate)->subDay()->toDateString()
+                : $bookingDate;
+            $checkEnd = (!$bypass && $item->has_cleaning_gap)
+                ? Carbon::parse($returnDate)->addDay()->toDateString()
+                : $returnDate;
 
             $bookedByCustomers = BookingItem::where('item_id', $itemId)
                 ->whereHas('booking', function ($q) use ($checkStart, $checkEnd, $excludeBookingId) {
@@ -62,7 +71,29 @@ class BookingService
                 ->where('end_date', '>=', $checkStart)
                 ->sum('quantity');
 
-            $available = $item->quantity - $bookedByCustomers - $blockedByMaintenance;
+            // Count RETURNED booking items still in their cleaning window (not yet released).
+            // Uses a savepoint when inside a transaction so a missing column doesn't abort it.
+            $cleaningBlockedUnits = 0;
+            if (!$bypass && $item->has_cleaning_gap) {
+                $inTransaction = DB::transactionLevel() > 0;
+                try {
+                    if ($inTransaction) DB::statement('SAVEPOINT cleaning_check');
+                    $cleaningBlockedUnits = BookingItem::where('item_id', $itemId)
+                        ->where('cleaning_gap_released', false)
+                        ->whereHas('booking', function ($q) use ($checkStart, $returnDate) {
+                            $q->where('status', 'RETURNED')
+                              ->whereDate('return_date', '>=', $checkStart)
+                              ->whereDate('return_date', '<=', $returnDate);
+                        })
+                        ->count();
+                    if ($inTransaction) DB::statement('RELEASE SAVEPOINT cleaning_check');
+                } catch (\Exception $e) {
+                    if ($inTransaction) DB::statement('ROLLBACK TO SAVEPOINT cleaning_check');
+                    $cleaningBlockedUnits = 0;
+                }
+            }
+
+            $available = $item->quantity - $bookedByCustomers - $blockedByMaintenance - $cleaningBlockedUnits;
             if ($requestedQty > $available) {
                 abort(400, "Only {$available} unit(s) of '{$item->name}' available for the selected date range.");
             }
@@ -76,7 +107,14 @@ class BookingService
             $itemIds = array_unique(array_column($data['items'], 'itemId'));
             Item::whereIn('id', $itemIds)->lockForUpdate()->get();
 
-            $this->checkConflicts(array_column($data['items'], 'itemId'), $data['bookingDate'], $data['returnDate']);
+            $bypassIds = $data['bypassCleaningGapItemIds'] ?? [];
+            $this->checkConflicts(
+                array_column($data['items'], 'itemId'),
+                $data['bookingDate'],
+                $data['returnDate'],
+                null,
+                $bypassIds
+            );
 
             // Auto-create or link customer
             $customerId = $data['customerId'] ?? null;
