@@ -8,15 +8,15 @@ use Illuminate\Support\Facades\Route;
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
-        web: __DIR__.'/../routes/web.php',
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
         then: function () {
-            // Register API routes without the default /api prefix
-            // to mirror the Spring Boot URL structure exactly.
-            // Vue frontend uses /login, /auth/*, /api/... etc.
+            // API routes registered first so they take priority over the Vue catch-all
             Route::middleware('api')
                 ->group(base_path('routes/api.php'));
+            // Vue catch-all must come last
+            Route::middleware('web')
+                ->group(base_path('routes/web.php'));
         },
     )
     ->withMiddleware(function (Middleware $middleware): void {

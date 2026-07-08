@@ -203,8 +203,35 @@ body {
 ═══════════════════════════════════════ */
 .deposit-table { width: 58%; border-collapse: collapse; }
 .deposit-table td { padding: 8px 14px; font-size: 10px; border-bottom: 1px solid #eeeeee; }
-.deposit-held { color: #e65100; font-weight: bold; }
+.deposit-held     { color: #e65100; font-weight: bold; }
 .deposit-returned { color: #2e7d32; font-weight: bold; }
+.deposit-kept     { color: #c62828; font-weight: bold; }
+.deposit-excess   { color: #b71c1c; font-weight: bold; }
+
+/* ═══════════════════════════════════════
+   CANCELLATION BOX
+═══════════════════════════════════════ */
+.cancel-box {
+    background: #ffebee;
+    border: 1.5px solid #ef9a9a;
+    border-left: 4px solid #c62828;
+    padding: 12px 16px;
+    margin-bottom: 0;
+}
+.cancel-box-title {
+    font-size: 9px; font-weight: bold; letter-spacing: 1.5px;
+    text-transform: uppercase; color: #c62828; margin-bottom: 8px;
+}
+.cancel-table { width: 58%; border-collapse: collapse; }
+.cancel-table td { padding: 6px 14px; font-size: 10px; border-bottom: 1px solid #ffcdd2; }
+.cancel-label  { color: #546e7a; }
+.cancel-val    { text-align: right; font-weight: bold; color: #212121; }
+.cancel-refund { text-align: right; font-weight: bold; color: #2e7d32; }
+.cancel-kept   { text-align: right; font-weight: bold; color: #c62828; font-size: 12px; }
+.cancel-reason {
+    font-size: 9px; color: #546e7a; font-style: italic;
+    margin-top: 8px; padding-top: 6px; border-top: 1px solid #ffcdd2;
+}
 
 /* ═══════════════════════════════════════
    ACKNOWLEDGMENT SIGNATURE
@@ -351,10 +378,32 @@ body {
 
 {{-- ════════════════════════ PAYMENT SUMMARY ════════════════════════ --}}
 @php
-    $balance = (float)$booking->total_agreed_price - (float)$booking->total_advance_payment;
-    $hasDue  = $balance > 0.001;
+    $isCancelled = $booking->status === 'CANCELLED';
+    $refund      = (float)($booking->refund_amount ?? 0);
+    $advance     = (float)$booking->total_advance_payment;
+    $netKept     = max(0, $advance - $refund);
+    $balance     = (float)$booking->total_agreed_price - $advance;
+    $hasDue      = !$isCancelled && $balance > 0.001;
 @endphp
 <div class="section-title">Payment Summary</div>
+@if($isCancelled)
+<table class="cancel-table">
+<tr>
+    <td class="cancel-label">Advance Paid</td>
+    <td class="cancel-val">{{ number_format($advance, 2) }} ETB</td>
+</tr>
+@if($refund > 0)
+<tr>
+    <td class="cancel-label">Refund Given</td>
+    <td class="cancel-refund">- {{ number_format($refund, 2) }} ETB</td>
+</tr>
+@endif
+<tr style="border-top: 1.5px solid #ef9a9a;">
+    <td class="cancel-label" style="font-weight:bold;">Net Kept by Shop</td>
+    <td class="cancel-kept">{{ number_format($netKept, 2) }} ETB</td>
+</tr>
+</table>
+@else
 <table class="pay-table">
 <tr>
     <td class="pay-label">Total Agreed Price</td>
@@ -362,30 +411,84 @@ body {
 </tr>
 <tr>
     <td class="pay-label">Total Paid</td>
-    <td class="paid-val">{{ number_format($booking->total_advance_payment, 2) }} ETB</td>
+    <td class="paid-val">{{ number_format($advance, 2) }} ETB</td>
 </tr>
 <tr class="{{ $hasDue ? 'pay-due-has' : 'pay-due-ok' }}">
     <td class="{{ $hasDue ? 'pay-due-label-has' : 'pay-due-label-ok' }}">Balance Due</td>
     <td class="{{ $hasDue ? 'pay-due-val-has' : 'pay-due-val-ok' }}">{{ number_format($balance, 2) }} ETB</td>
 </tr>
 </table>
+@endif
 
-{{-- ════════════════════════ SECURITY DEPOSIT ════════════════════════ --}}
-@if((float)$booking->security_deposit > 0)
-<div class="section-title">Security Deposit</div>
+{{-- ════════════════════════ CANCELLATION DETAILS ════════════════════════ --}}
+@if($isCancelled)
+@php $cancelledAt = $booking->cancelled_at ? \Carbon\Carbon::parse($booking->cancelled_at)->format('F j, Y  H:i') : null; @endphp
+<div class="section-title">Cancellation Details</div>
+<div class="cancel-box">
+    <div class="cancel-box-title">Booking Cancelled</div>
+    @if($cancelledAt)
+    <div style="font-size:9px;color:#546e7a;margin-bottom:4px;">Cancelled on: {{ $cancelledAt }}</div>
+    @endif
+    @if($booking->cancellation_reason)
+    <div class="cancel-reason">Reason: {{ $booking->cancellation_reason }}</div>
+    @endif
+</div>
+@endif
+
+{{-- ════════════════════════ SECURITY DEPOSIT & DAMAGE ════════════════════════ --}}
+@php
+    $deposit      = (float)($booking->security_deposit ?? 0);
+    $deduction    = (float)($booking->deposit_deduction ?? 0);
+    $excess       = (float)($booking->excess_damage_charge ?? 0);
+    $depReason    = $booking->deposit_deduction_reason;
+    $showDeposit  = $deposit > 0 || $excess > 0;
+@endphp
+@if($showDeposit)
+<div class="section-title">{{ $deposit > 0 ? 'Security Deposit' : 'Damage Charge' }}</div>
 <table class="deposit-table">
+@if($deposit > 0)
 <tr>
-    <td class="pay-label">Amount</td>
-    <td class="pay-val">{{ number_format($booking->security_deposit, 2) }} ETB</td>
+    <td class="pay-label">Deposit Collected</td>
+    <td class="pay-val">{{ number_format($deposit, 2) }} ETB</td>
 </tr>
+@endif
+@if($deduction > 0)
+<tr>
+    <td class="pay-label">Kept for Damage</td>
+    <td class="deposit-kept">- {{ number_format($deduction, 2) }} ETB</td>
+</tr>
+@endif
+@if($deposit > 0 && $deduction == 0 && $excess == 0)
 <tr>
     <td class="pay-label">Status</td>
-    @if($booking->security_deposit_returned || $booking->status === 'RETURNED')
-    <td class="deposit-returned">Returned ✓</td>
+    @if($booking->security_deposit_returned)
+    <td class="deposit-returned">Returned to customer ✓</td>
     @else
     <td class="deposit-held">Held</td>
     @endif
 </tr>
+@endif
+@if($deposit > 0 && $deduction > 0 && $excess == 0)
+@php $depositBack = max(0, $deposit - $deduction); @endphp
+@if($depositBack > 0)
+<tr>
+    <td class="pay-label">Remainder Returned</td>
+    <td class="deposit-returned">{{ number_format($depositBack, 2) }} ETB ✓</td>
+</tr>
+@endif
+@endif
+@if($excess > 0)
+<tr style="border-top: 1.5px solid #ffcdd2;">
+    <td class="pay-label" style="font-weight:bold;">{{ $deposit > 0 ? 'Extra Damage Charge' : 'Damage Charge' }}</td>
+    <td class="deposit-excess">{{ number_format($excess, 2) }} ETB — collected at return</td>
+</tr>
+@endif
+@if($depReason)
+<tr>
+    <td class="pay-label">Damage Reason</td>
+    <td style="color:#546e7a;font-style:italic;">{{ $depReason }}</td>
+</tr>
+@endif
 </table>
 @endif
 

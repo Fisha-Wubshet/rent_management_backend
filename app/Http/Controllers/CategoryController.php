@@ -1,39 +1,56 @@
 <?php
-
 namespace App\Http\Controllers;
 
 use App\Models\Category;
-use App\Models\Item;
 use Illuminate\Http\Request;
 
 class CategoryController extends Controller
 {
-    private function shopId(): int
+    private function branchId(Request $request): int
     {
         $user = auth('api')->user();
-        return $user->shop_id ?? $user->branch->shop_id;
+        $id   = (int) ($request->branchId ?? $user->branch_id ?? 0);
+        if (!$id) abort(422, 'A branch must be selected.');
+        return $id;
     }
 
-    public function index() { return response()->json(Category::where('shop_id', $this->shopId())->where('deleted', false)->get()); }
+    public function index(Request $request)
+    {
+        $branchId = $this->branchId($request);
+        return response()->json(
+            Category::where('branch_id', $branchId)
+                    ->where('deleted', false)
+                    ->orderBy('name')
+                    ->get()
+        );
+    }
 
     public function store(Request $request)
     {
-        $data = $request->validate(['name' => 'required|string']);
-        return response()->json(Category::create(['name' => $data['name'], 'shop_id' => $this->shopId()]), 201);
+        $data     = $request->validate(['name' => 'required|string|max:255']);
+        $branchId = $this->branchId($request);
+        $category = Category::create([
+            'name'      => $data['name'],
+            'shop_id'   => auth('api')->user()->shop_id ?? auth('api')->user()->branch->shop_id,
+            'branch_id' => $branchId,
+        ]);
+        return response()->json($category, 201);
     }
 
     public function update(Request $request, $id)
     {
-        $cat = Category::where('shop_id', $this->shopId())->findOrFail($id);
-        $cat->update($request->only(['name']));
-        return response()->json($cat->fresh());
+        $data     = $request->validate(['name' => 'required|string|max:255']);
+        $branchId = $this->branchId($request);
+        $category = Category::where('id', $id)->where('branch_id', $branchId)->firstOrFail();
+        $category->update(['name' => $data['name']]);
+        return response()->json($category);
     }
 
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
-        $cat = Category::where('shop_id', $this->shopId())->findOrFail($id);
-        Item::where('category_id', $id)->update(['category_id' => null]);
-        $cat->update(['deleted' => true]);
-        return response()->json(['message' => 'Category deleted.']);
+        $branchId = $this->branchId($request);
+        $category = Category::where('id', $id)->where('branch_id', $branchId)->firstOrFail();
+        $category->update(['deleted' => true]);
+        return response()->json(['message' => 'Category deleted']);
     }
 }

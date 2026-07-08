@@ -14,10 +14,12 @@ class AuditLogController extends Controller
         return $user->shop_id ?? $user->branch->shop_id;
     }
 
-    private function branchConstraint(): ?int
+    private function branchConstraint(Request $request): int
     {
         $user = auth('api')->user();
-        return $user->hasRole('ROLE_BRANCH_MANAGER') ? $user->branch_id : null;
+        $id   = (int) ($request->branchId ?? $user->branch_id ?? 0);
+        if (!$id) abort(422, 'A branch must be selected.');
+        return $id;
     }
 
     private function applyFilters($query, Request $request): void
@@ -26,7 +28,6 @@ class AuditLogController extends Controller
         if ($request->performedBy) $query->where('performed_by', 'ilike', "%{$request->performedBy}%");
         if ($request->dateFrom)    $query->whereDate('timestamp', '>=', $request->dateFrom);
         if ($request->dateTo)      $query->whereDate('timestamp', '<=', $request->dateTo);
-        if ($request->branchId)    $query->where('branch_id', $request->branchId);
         if ($request->entityType)  $query->where('entity_type', $request->entityType);
     }
 
@@ -63,8 +64,9 @@ class AuditLogController extends Controller
 
     public function index(Request $request)
     {
-        $query = AuditLog::where('shop_id', $this->shopId());
-        if ($branch = $this->branchConstraint()) $query->where('branch_id', $branch);
+        $branchId = $this->branchConstraint($request);
+        $query = AuditLog::where('shop_id', $this->shopId())
+            ->where('branch_id', $branchId);
         $this->applyFilters($query, $request);
         return response()->json($this->fillNames($query->orderByDesc('timestamp')->paginate($request->size ?? 25)));
     }
@@ -95,11 +97,12 @@ class AuditLogController extends Controller
         return response()->json($this->fillNames($query->orderByDesc('timestamp')->paginate($request->size ?? 20)));
     }
 
-    public function todaySummary()
+    public function todaySummary(Request $request)
     {
+        $branchId = $this->branchConstraint($request);
         $query = AuditLog::where('shop_id', $this->shopId())
-            ->whereDate('timestamp', today());
-        if ($branch = $this->branchConstraint()) $query->where('branch_id', $branch);
+            ->whereDate('timestamp', today())
+            ->where('branch_id', $branchId);
         $logs    = $query->get();
         $nameMap = $this->nameMap($logs);
 
@@ -115,11 +118,39 @@ class AuditLogController extends Controller
         ]);
     }
 
+    public function byStaff(Request $request, string $email)
+    {
+        $branchId = $this->branchConstraint($request);
+        $query = AuditLog::where('branch_id', $branchId)
+            ->where('performed_by', $email);
+        $this->applyFilters($query, $request);
+        return response()->json($this->fillNames($query->orderByDesc('timestamp')->paginate($request->size ?? 20)));
+    }
+
+    public function staffSummary(Request $request, string $email)
+    {
+        $branchId = $this->branchConstraint($request);
+        $logs = AuditLog::where('branch_id', $branchId)
+            ->where('performed_by', $email)
+            ->get();
+
+        $thisMonth = $logs->filter(fn($log) => $log->timestamp->isCurrentMonth())->count();
+        $lastSeen  = $logs->max('timestamp');
+
+        return response()->json([
+            'total'     => $logs->count(),
+            'thisMonth' => $thisMonth,
+            'lastSeen'  => $lastSeen,
+            'byAction'  => $logs->countBy('action'),
+        ]);
+    }
+
     public function export(Request $request)
     {
         $request->validate(['dateFrom' => 'required|date', 'dateTo' => 'required|date']);
-        $query = AuditLog::where('shop_id', $this->shopId());
-        if ($branch = $this->branchConstraint()) $query->where('branch_id', $branch);
+        $branchId = $this->branchConstraint($request);
+        $query = AuditLog::where('shop_id', $this->shopId())
+            ->where('branch_id', $branchId);
         $this->applyFilters($query, $request);
         $logs    = $query->orderByDesc('timestamp')->get();
         $nameMap = $this->nameMap($logs);

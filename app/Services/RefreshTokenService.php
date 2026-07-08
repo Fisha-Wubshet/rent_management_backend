@@ -10,7 +10,10 @@ class RefreshTokenService
 {
     public function create(User $user): RefreshToken
     {
-        RefreshToken::where('user_id', $user->id)->delete();
+        // Delete only expired tokens; keep active tokens from other sessions/devices
+        RefreshToken::where('user_id', $user->id)
+            ->where('expires_at', '<', now())
+            ->delete();
         return RefreshToken::create([
             'user_id' => $user->id,
             'token' => Str::random(64),

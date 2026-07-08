@@ -7,6 +7,7 @@ use App\Models\BookingItem;
 use App\Models\BookingChangeLog;
 use App\Models\Item;
 use App\Models\ItemBlock;
+use App\Models\Payment;
 use App\Services\BookingService;
 use App\Services\AuditLogService;
 use App\Services\PdfService;
@@ -26,6 +27,22 @@ class BookingController extends Controller
     {
         $u = auth('api')->user();
         return trim(($u->first_name ?? '') . ' ' . ($u->last_name ?? '')) ?: $u->email;
+    }
+
+    private function logPayment(Booking $booking, string $type, float $amount, ?string $notes = null): void
+    {
+        if ($amount <= 0) return;
+        $user = auth('api')->user();
+        Payment::create([
+            'booking_id'       => $booking->id,
+            'shop_id'          => $booking->shop_id,
+            'branch_id'        => $booking->branch_id,
+            'type'             => $type,
+            'amount'           => $amount,
+            'recorded_by_id'   => $user?->id,
+            'recorded_by_name' => $this->actorName(),
+            'notes'            => $notes,
+        ]);
     }
 
     private function authorizedBooking(int $id): Booking
@@ -77,6 +94,14 @@ class BookingController extends Controller
         $shopId   = $user->shop_id ?? $user->branch->shop_id;
         $branchId = (int) ($request->branchId ?? $user->branch_id ?? $user->branch?->id);
         $booking  = $this->bookingService->createInvoice($data, $shopId, $branchId, $user->email);
+
+        if (($data['totalAdvancePayment'] ?? 0) > 0) {
+            $this->logPayment($booking, 'ADVANCE', (float) $data['totalAdvancePayment']);
+        }
+        if (($data['securityDeposit'] ?? 0) > 0) {
+            $this->logPayment($booking, 'SECURITY_DEPOSIT', (float) $data['securityDeposit']);
+        }
+
         return response()->json($booking, 201);
     }
 
@@ -94,7 +119,12 @@ class BookingController extends Controller
         if ($request->startDate)     $query->where('booking_date', '>=', $request->startDate);
         if ($request->endDate)       $query->where('booking_date', '<=', $request->endDate);
         if ($request->phone)         $query->where('phone_number', 'like', "%{$request->phone}%");
-        if ($request->invoiceNumber) $query->where('invoice_number', 'like', "%{$request->invoiceNumber}%");
+        if ($request->invoiceNumber) {
+            // Normalize: strip REF- prefix (case-insensitive) and uppercase so
+            // "oq4ahz0a", "ref-oq4ahz0a", "REF-OQ4AHZ0A" all match the same record.
+            $refCode = strtoupper(preg_replace('/^REF-/i', '', trim($request->invoiceNumber)));
+            $query->where('invoice_number', 'like', "%{$refCode}%");
+        }
         if ($request->bookingType)   $query->where('booking_type', $request->bookingType);
         if ($request->dressCode)     $query->whereHas('items.item', fn($q) => $q->where('unique_code', $request->dressCode));
 
@@ -131,6 +161,7 @@ class BookingController extends Controller
         $booking->increment('total_advance_payment', $data['amount']);
         $user = auth('api')->user();
         $this->audit->log('Booking', $booking->id, 'PAYMENT_RECORDED', $user->email, $booking->shop_id, $booking->branch_id, "Paid: {$data['amount']}", $this->actorName());
+        $this->logPayment($booking, 'ADDITIONAL', (float) $data['amount']);
         return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
@@ -146,15 +177,17 @@ class BookingController extends Controller
         $booking->update(['status' => 'PICKED_UP']);
         $user = auth('api')->user();
         $this->audit->log('Booking', $booking->id, 'PICKED_UP', $user->email, $booking->shop_id, $booking->branch_id, null, $this->actorName());
+        if ($data['amount'] ?? 0)          $this->logPayment($booking, 'ADDITIONAL',        (float) $data['amount'], 'Collected at pickup');
+        if ($data['securityDeposit'] ?? 0) $this->logPayment($booking, 'SECURITY_DEPOSIT',  (float) $data['securityDeposit']);
         return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
     public function completeReturn(Request $request, $id)
     {
         $data = $request->validate([
-            'amount'                 => 'nullable|numeric|min:0',
-            'depositDeduction'       => 'nullable|numeric|min:0',
-            'depositDeductionReason' => 'nullable|string|max:500',
+            'amount'       => 'nullable|numeric|min:0',
+            'damageAmount' => 'nullable|numeric|min:0',
+            'damageReason' => 'nullable|string|max:500',
         ]);
 
         $booking = $this->authorizedBooking((int) $id);
@@ -171,26 +204,49 @@ class BookingController extends Controller
             $updates['return_date'] = Carbon::today()->toDateString();
         }
 
-        if (($booking->security_deposit ?? 0) > 0) {
-            $deduction = isset($data['depositDeduction'])
-                ? min((float) $data['depositDeduction'], (float) $booking->security_deposit)
-                : 0;
-            $updates['security_deposit_returned']  = true;
-            $updates['deposit_deduction']          = $deduction;
-            $updates['deposit_deduction_reason']   = $data['depositDeductionReason'] ?? null;
+        $damageAmt  = (float) ($data['damageAmount'] ?? 0);
+        $depositAmt = (float) ($booking->security_deposit ?? 0);
+
+        // Always record damage — even when no deposit was collected
+        $updates['deposit_deduction']        = min($damageAmt, $depositAmt);
+        $updates['deposit_deduction_reason'] = $data['damageReason'] ?? null;
+        $updates['excess_damage_charge']     = max(0.0, $damageAmt - $depositAmt);
+        if ($depositAmt > 0) {
+            $updates['security_deposit_returned'] = true;
         }
 
         $booking->update($updates);
         BookingItem::where('booking_id', $id)->update(['is_returned' => true]);
-        $user = auth('api')->user();
-        $depositNote = null;
-        if (($booking->security_deposit ?? 0) > 0) {
-            $deductionAmt = $updates['deposit_deduction'] ?? 0;
-            $returnedAmt  = (float) $booking->security_deposit - (float) $deductionAmt;
-            $depositNote  = "Deposit: {$deductionAmt} kept, {$returnedAmt} returned";
-            if (!empty($data['depositDeductionReason'])) $depositNote .= " ({$data['depositDeductionReason']})";
+
+        $auditNote = null;
+        if ($damageAmt > 0) {
+            $covered  = min($damageAmt, $depositAmt);
+            $excess   = max(0.0, $damageAmt - $depositAmt);
+            $returned = max(0.0, $depositAmt - $covered);
+            $auditNote = "Damage: {$damageAmt}";
+            if ($depositAmt > 0) $auditNote .= " | Deposit kept: {$covered}, returned: {$returned}";
+            if ($excess > 0)     $auditNote .= " | Extra damage collected: {$excess}";
+            if (!empty($data['damageReason'])) $auditNote .= " ({$data['damageReason']})";
+        } elseif ($depositAmt > 0) {
+            $auditNote = "No damage — deposit {$depositAmt} returned in full";
         }
-        $this->audit->log('Booking', $booking->id, 'RETURNED', $user->email, $booking->shop_id, $booking->branch_id, $depositNote, $this->actorName());
+
+        $user = auth('api')->user();
+        $this->audit->log('Booking', $booking->id, 'RETURNED', $user->email, $booking->shop_id, $booking->branch_id, $auditNote, $this->actorName());
+
+        if ($data['amount'] ?? 0) $this->logPayment($booking, 'ADDITIONAL', (float) $data['amount'], 'Collected at return');
+
+        if ($damageAmt > 0) {
+            $deducted = min($damageAmt, $depositAmt);
+            $excess   = max(0.0, $damageAmt - $depositAmt);
+            $returned = max(0.0, $depositAmt - $deducted);
+            if ($deducted > 0) $this->logPayment($booking, 'DEPOSIT_DEDUCTED', $deducted, $data['damageReason'] ?? null);
+            if ($excess > 0)   $this->logPayment($booking, 'DAMAGE_CHARGE',    $excess,   $data['damageReason'] ?? null);
+            if ($returned > 0) $this->logPayment($booking, 'DEPOSIT_RETURNED', $returned, 'Partial deposit returned to customer');
+        } elseif ($depositAmt > 0) {
+            $this->logPayment($booking, 'DEPOSIT_RETURNED', $depositAmt, 'Full deposit returned to customer');
+        }
+
         return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
@@ -223,16 +279,100 @@ class BookingController extends Controller
         return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
-    public function cancel($id)
+    public function cancel(Request $request, $id)
     {
+        $data = $request->validate([
+            'refundAmount'       => 'nullable|numeric|min:0',
+            'cancellationReason' => 'nullable|string|max:500',
+            'damageAmount'       => 'nullable|numeric|min:0',
+            'damageReason'       => 'nullable|string|max:500',
+        ]);
+
         $booking = $this->authorizedBooking((int) $id);
         if (in_array($booking->status, ['RETURNED', 'CANCELLED'])) {
             abort(400, 'Booking is already ' . strtolower($booking->status) . ' and cannot be cancelled.');
         }
-        $booking->update(['status' => 'CANCELLED']);
+
+        $wasPickedUp = $booking->status === 'PICKED_UP';
+        $advancePaid = (float) $booking->total_advance_payment;
+        $refundInput = (float) ($data['refundAmount'] ?? 0);
+
+        if ($refundInput > $advancePaid) {
+            abort(400, "Refund amount ({$refundInput}) cannot exceed the advance payment ({$advancePaid}).");
+        }
+
+        $refund = $refundInput;
+
+        $updates = [
+            'status'              => 'CANCELLED',
+            'cancelled_at'        => now(),
+            'refund_amount'       => $refund,
+            'cancellation_reason' => $data['cancellationReason'] ?? null,
+        ];
+
+        if ($wasPickedUp) {
+            BookingItem::where('booking_id', $id)->update(['is_returned' => true]);
+            $damageAmt  = (float) ($data['damageAmount'] ?? 0);
+            $depositAmt = (float) ($booking->security_deposit ?? 0);
+            $updates['deposit_deduction']        = min($damageAmt, $depositAmt);
+            $updates['deposit_deduction_reason'] = $data['damageReason'] ?? null;
+            $updates['excess_damage_charge']     = max(0.0, $damageAmt - $depositAmt);
+            if ($depositAmt > 0) {
+                $updates['security_deposit_returned'] = true;
+            }
+        } else {
+            if (($booking->security_deposit ?? 0) > 0) {
+                $updates['security_deposit_returned'] = true;
+                $updates['deposit_deduction']         = 0;
+                $updates['excess_damage_charge']      = 0;
+            }
+        }
+
+        $booking->update($updates);
+
+        $kept = $advancePaid - $refund;
+        $parts = ["Refunded: {$refund}", "Shop kept: {$kept}"];
+        if ($wasPickedUp) {
+            $parts[] = 'Was picked up';
+            $damageAmt = (float) ($data['damageAmount'] ?? 0);
+            if ($damageAmt > 0) {
+                $depositAmt  = (float) ($booking->security_deposit ?? 0);
+                $deducted    = min($damageAmt, $depositAmt);
+                $extraDamage = max(0.0, $damageAmt - $depositAmt);
+                if ($deducted > 0)    $parts[] = "Deposit kept for damage: {$deducted}";
+                if ($extraDamage > 0) $parts[] = "Extra damage collected: {$extraDamage}";
+                if ($data['damageReason'] ?? null) $parts[] = "Damage reason: {$data['damageReason']}";
+            }
+        }
+        if ($data['cancellationReason'] ?? null) $parts[] = "Reason: {$data['cancellationReason']}";
+        $note = implode(' | ', $parts);
+
         $user = auth('api')->user();
-        $this->audit->log('Booking', $booking->id, 'CANCELLED', $user->email, $booking->shop_id, $booking->branch_id, null, $this->actorName());
-        return response()->json($booking->load('items.item', 'customer', 'branch'));
+        $this->audit->log('Booking', $booking->id, 'CANCELLED', $user->email, $booking->shop_id, $booking->branch_id, $note, $this->actorName());
+
+        if ($refund > 0) $this->logPayment($booking, 'REFUND', $refund, $data['cancellationReason'] ?? null);
+
+        if ($wasPickedUp) {
+            $damageAmt  = (float) ($data['damageAmount'] ?? 0);
+            $depositAmt = (float) ($booking->security_deposit ?? 0);
+            if ($damageAmt > 0) {
+                $deducted = min($damageAmt, $depositAmt);
+                $excess   = max(0.0, $damageAmt - $depositAmt);
+                $returned = max(0.0, $depositAmt - $deducted);
+                if ($deducted > 0) $this->logPayment($booking, 'DEPOSIT_DEDUCTED', $deducted, $data['damageReason'] ?? null);
+                if ($excess > 0)   $this->logPayment($booking, 'DAMAGE_CHARGE',    $excess,   $data['damageReason'] ?? null);
+                if ($returned > 0) $this->logPayment($booking, 'DEPOSIT_RETURNED', $returned, 'Partial deposit returned to customer');
+            } elseif ($depositAmt > 0) {
+                $this->logPayment($booking, 'DEPOSIT_RETURNED', $depositAmt, 'Full deposit returned on cancellation');
+            }
+        } else {
+            $depositAmt = (float) ($booking->security_deposit ?? 0);
+            if ($depositAmt > 0) {
+                $this->logPayment($booking, 'DEPOSIT_RETURNED', $depositAmt, 'Deposit returned on cancellation');
+            }
+        }
+
+        return response()->json($booking->fresh()->load('items.item', 'customer', 'branch'));
     }
 
     public function update(Request $request, $id)
@@ -530,6 +670,14 @@ class BookingController extends Controller
         return response()->json($logs);
     }
 
+    public function payments($id)
+    {
+        $this->authorizedBooking((int) $id);
+        return response()->json(
+            Payment::where('booking_id', $id)->orderBy('created_at')->get()
+        );
+    }
+
     public function changeItems(Request $request, $id)
     {
         $changeUser = auth('api')->user();
@@ -647,6 +795,10 @@ class BookingController extends Controller
                 $updates['return_date']  = $returnDate;
             }
             if ($updates) $booking->update($updates);
+
+            if ($additionalPayment > 0) {
+                $this->logPayment($booking, 'ADDITIONAL', $additionalPayment, 'Collected during booking modification');
+            }
 
             return $booking->fresh()->load('items.item', 'changeLogs');
         });

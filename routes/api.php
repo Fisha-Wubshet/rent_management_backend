@@ -11,6 +11,7 @@ use App\Http\Controllers\ReportController;
 use App\Http\Controllers\AuditLogController;
 use App\Http\Controllers\SuperAdminController;
 use App\Http\Controllers\SubscriptionController;
+use App\Http\Controllers\PaymentController;
 
 /*
  * URL structure mirrors Spring Boot (port 8080, no context-path).
@@ -53,6 +54,9 @@ Route::middleware('jwt.auth')->group(function () {
             Route::get('/audit-logs', [AuditLogController::class, 'index']);
             Route::get('/audit-logs/today-summary', [AuditLogController::class, 'todaySummary']);
             Route::get('/audit-logs/export', [AuditLogController::class, 'export']);
+            Route::get('/audit-logs/by-staff/{email}', [AuditLogController::class, 'byStaff'])->where('email', '.+');
+            Route::get('/audit-logs/staff-summary/{email}', [AuditLogController::class, 'staffSummary'])->where('email', '.+');
+            Route::get('/payments', [PaymentController::class, 'index']);
         });
 
         // Super admin
@@ -94,6 +98,7 @@ Route::middleware('jwt.auth')->group(function () {
         Route::post('/bookings/items/{itemId}/return', [BookingController::class, 'markItemReturned']);
         Route::get('/bookings/{id}', [BookingController::class, 'show']);
         Route::put('/bookings/{id}', [BookingController::class, 'update']);
+        Route::post('/bookings/{id}/cancel', [BookingController::class, 'cancel']);
         Route::delete('/bookings/{id}', [BookingController::class, 'cancel']);
         Route::post('/bookings/{id}/status', [BookingController::class, 'updateStatus']);
         Route::post('/bookings/{id}/pay', [BookingController::class, 'payDue']);
@@ -102,6 +107,7 @@ Route::middleware('jwt.auth')->group(function () {
         Route::post('/bookings/{id}/release-cleaning', [BookingController::class, 'releaseCleaning']);
         Route::get('/bookings/{id}/invoice/pdf', [BookingController::class, 'downloadInvoicePdf']);
         Route::get('/bookings/{id}/change-logs', [BookingController::class, 'changeLogs']);
+        Route::get('/bookings/{id}/payments', [BookingController::class, 'payments']);
         Route::patch('/bookings/{id}/change-items', [BookingController::class, 'changeItems']);
 
         // Customers (specific routes before resource to avoid conflicts)
@@ -139,6 +145,7 @@ Route::middleware('jwt.auth')->group(function () {
         Route::get('/reports/receivables-aging', [ReportController::class, 'receivablesAging']);
         Route::get('/reports/year-over-year', [ReportController::class, 'yearOverYear']);
         Route::get('/reports/inventory-utilization', [ReportController::class, 'inventoryUtilization']);
+        Route::get('/reports/deposits', [ReportController::class, 'depositSummary']);
 
         // Audit logs
         Route::get('/audit-logs/mine', [AuditLogController::class, 'mine']);

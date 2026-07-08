@@ -6,7 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 
 class Category extends Model
 {
-    protected $fillable = ['name', 'shop_id', 'deleted'];
+    protected $fillable = ['name', 'shop_id', 'branch_id', 'deleted'];
     protected $casts = ['deleted' => 'boolean'];
 
     public function shop() { return $this->belongsTo(Shop::class); }

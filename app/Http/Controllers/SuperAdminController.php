@@ -50,7 +50,11 @@ class SuperAdminController extends Controller
     public function updateShop(Request $request, $id)
     {
         $shop = Shop::findOrFail($id);
-        $shop->update($request->only(['name', 'address', 'item_label']));
+        $data = $request->only(['name', 'address', 'item_label']);
+        if ($request->has('itemLabel')) {
+            $data['item_label'] = $request->input('itemLabel');
+        }
+        $shop->update($data);
         return response()->json($shop->fresh());
     }
 

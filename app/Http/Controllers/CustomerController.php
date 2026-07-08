@@ -32,7 +32,8 @@ class CustomerController extends Controller
                 ->orWhere('last_name', 'ilike', "%$s%")
                 ->orWhere('phone_number', 'like', "%$s%"));
         }
-        return response()->json($query->orderByDesc('id')->paginate($request->size ?? 20));
+        $perPage = $request->per_page ?? $request->size ?? 20;
+        return response()->json($query->withCount('bookings')->orderByDesc('id')->paginate($perPage));
     }
 
     public function store(Request $request)
@@ -67,13 +68,14 @@ class CustomerController extends Controller
     public function stats($id)
     {
         $customer = Customer::where('shop_id', $this->shopId())->findOrFail($id);
-        $bookings = $customer->bookings()->where('status', '!=', 'CANCELLED')->get();
+        $all = $customer->bookings()->get();
+        $active = $all->filter(fn($b) => $b->status !== 'CANCELLED');
         return response()->json([
-            'totalBookings'    => $bookings->count(),
-            'totalSpent'       => (float) $bookings->sum('total_agreed_price'),
-            'totalPaid'        => (float) $bookings->sum('total_advance_payment'),
-            'totalOutstanding' => (float) ($bookings->sum('total_agreed_price') - $bookings->sum('total_advance_payment')),
-            'lastBookingDate'  => $bookings->max('booking_date'),
+            'totalBookings'    => $all->count(),
+            'totalSpent'       => (float) $active->sum('total_agreed_price'),
+            'totalPaid'        => (float) $active->sum('total_advance_payment'),
+            'totalOutstanding' => (float) ($active->sum('total_agreed_price') - $active->sum('total_advance_payment')),
+            'lastBookingDate'  => $all->max('booking_date'),
         ]);
     }
 
@@ -110,10 +112,12 @@ class CustomerController extends Controller
 
     public function blacklist(Request $request, $id)
     {
-        $data = $request->validate(['reason' => 'required|string']);
+        $data = $request->validate(['reason' => 'nullable|string']);
+        $reason = $data['reason'] ?? null;
         $customer = Customer::where('shop_id', $this->shopId())->findOrFail($id);
-        $customer->update(['blacklisted' => true, 'blacklist_reason' => $data['reason'], 'blacklisted_at' => now()]);
-        $this->audit->log('Customer', $customer->id, 'BLACKLISTED', auth('api')->user()->email, $this->shopId(), null, "Reason: {$data['reason']}", $this->actorName());
+        $customer->update(['blacklisted' => true, 'blacklist_reason' => $reason, 'blacklisted_at' => now()]);
+        $auditNote = $reason ? "Reason: {$reason}" : 'No reason provided';
+        $this->audit->log('Customer', $customer->id, 'BLACKLISTED', auth('api')->user()->email, $this->shopId(), null, $auditNote, $this->actorName());
         return response()->json($customer->fresh());
     }
 

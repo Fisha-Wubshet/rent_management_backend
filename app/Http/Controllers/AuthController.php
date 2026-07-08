@@ -77,7 +77,7 @@ class AuthController extends Controller
 
     public function updateProfile(Request $request)
     {
-        $user = auth('api')->user();
+        $user = \App\Models\User::findOrFail(auth('api')->id());
         $data = $request->validate([
             'firstName' => 'nullable|string',
             'lastName' => 'nullable|string',
