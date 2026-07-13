@@ -45,21 +45,29 @@ class BookingController extends Controller
         ]);
     }
 
-    private function authorizedBooking(int $id): Booking
+    private function authorizedBooking(int $id, bool $requireBranchWrite = false): Booking
     {
         $booking = Booking::findOrFail($id);
         $user    = auth('api')->user();
         $shopId  = $user->shop_id ?? $user->branch->shop_id;
         if ((int) $booking->shop_id !== (int) $shopId) abort(403, 'Access denied.');
+        if ($requireBranchWrite && $user->hasAnyRole(['ROLE_STAFF', 'ROLE_BRANCH_MANAGER'])
+            && (int) $booking->branch_id !== (int) $user->branch_id) {
+            abort(403, 'You can only modify bookings from your own branch.');
+        }
         return $booking;
     }
 
-    private function authorizedBookingItem(int $itemId): BookingItem
+    private function authorizedBookingItem(int $itemId, bool $requireBranchWrite = false): BookingItem
     {
         $bi     = BookingItem::with('booking')->findOrFail($itemId);
         $user   = auth('api')->user();
         $shopId = $user->shop_id ?? $user->branch->shop_id;
         if ((int) $bi->booking->shop_id !== (int) $shopId) abort(403, 'Access denied.');
+        if ($requireBranchWrite && $user->hasAnyRole(['ROLE_STAFF', 'ROLE_BRANCH_MANAGER'])
+            && (int) $bi->booking->branch_id !== (int) $user->branch_id) {
+            abort(403, 'You can only modify bookings from your own branch.');
+        }
         return $bi;
     }
 
@@ -140,7 +148,7 @@ class BookingController extends Controller
     public function updateStatus(Request $request, $id)
     {
         $data = $request->validate(['status' => 'required|in:CONFIRMED,PICKED_UP,RETURNED,CANCELLED']);
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         $booking->update(['status' => $data['status']]);
         $user = auth('api')->user();
         $this->audit->log('Booking', $booking->id, 'STATUS_CHANGED', $user->email, $booking->shop_id, $booking->branch_id, "Status → {$data['status']}", $this->actorName());
@@ -150,7 +158,7 @@ class BookingController extends Controller
     public function payDue(Request $request, $id)
     {
         $data = $request->validate(['amount' => 'required|numeric|min:0']);
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         if (in_array($booking->status, ['RETURNED', 'CANCELLED'])) {
             abort(400, 'Cannot record payment on a booking that is already ' . strtolower($booking->status) . '.');
         }
@@ -168,7 +176,7 @@ class BookingController extends Controller
     public function pickup(Request $request, $id)
     {
         $data = $request->validate(['amount' => 'nullable|numeric|min:0', 'securityDeposit' => 'nullable|numeric|min:0']);
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         if ($booking->status !== 'CONFIRMED') {
             abort(400, 'Only a CONFIRMED booking can be marked as picked up. Current status: ' . $booking->status . '.');
         }
@@ -190,7 +198,7 @@ class BookingController extends Controller
             'damageReason' => 'nullable|string|max:500',
         ]);
 
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         if ($booking->status !== 'PICKED_UP') {
             abort(400, 'Only a PICKED_UP booking can be marked as returned. Current status: ' . $booking->status . '.');
         }
@@ -257,7 +265,7 @@ class BookingController extends Controller
             'releases.*.itemId'  => 'required|integer',
             'releases.*.count'   => 'required|integer|min:1',
         ]);
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         if ($booking->status !== 'RETURNED') {
             abort(400, 'Cleaning gap can only be released for a RETURNED booking.');
         }
@@ -288,7 +296,7 @@ class BookingController extends Controller
             'damageReason'       => 'nullable|string|max:500',
         ]);
 
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         if (in_array($booking->status, ['RETURNED', 'CANCELLED'])) {
             abort(400, 'Booking is already ' . strtolower($booking->status) . ' and cannot be cancelled.');
         }
@@ -377,7 +385,7 @@ class BookingController extends Controller
 
     public function update(Request $request, $id)
     {
-        $booking = $this->authorizedBooking((int) $id);
+        $booking = $this->authorizedBooking((int) $id, true);
         $request->validate([
             'bookingDate'      => 'nullable|date',
             'returnDate'       => 'nullable|date',
@@ -543,36 +551,51 @@ class BookingController extends Controller
     {
         $user = auth('api')->user();
         $shopId = $user->shop_id ?? $user->branch->shop_id;
-        $query = Booking::with('items.item', 'customer')
-            ->where('booking_date', today()->toDateString())
-            ->where('status', 'CONFIRMED');
-        if ($user->branch_id) $query->where('branch_id', $user->branch_id);
-        else $query->where('shop_id', $shopId);
-        return response()->json($query->get());
+        $branchId = $request->branchId ?? $user->branch_id;
+        if (!$branchId) abort(422, 'A branch must be selected.');
+
+        return response()->json(
+            Booking::with('items.item', 'customer')
+                ->where('shop_id', $shopId)
+                ->where('branch_id', $branchId)
+                ->where('booking_date', today()->toDateString())
+                ->where('status', 'CONFIRMED')
+                ->get()
+        );
     }
 
     public function dueToday(Request $request)
     {
         $user = auth('api')->user();
         $shopId = $user->shop_id ?? $user->branch->shop_id;
-        $query = Booking::with('items.item', 'customer')
-            ->where('return_date', today()->toDateString())
-            ->where('status', 'PICKED_UP');
-        if ($user->branch_id) $query->where('branch_id', $user->branch_id);
-        else $query->where('shop_id', $shopId);
-        return response()->json($query->get());
+        $branchId = $request->branchId ?? $user->branch_id;
+        if (!$branchId) abort(422, 'A branch must be selected.');
+
+        return response()->json(
+            Booking::with('items.item', 'customer')
+                ->where('shop_id', $shopId)
+                ->where('branch_id', $branchId)
+                ->where('return_date', today()->toDateString())
+                ->where('status', 'PICKED_UP')
+                ->get()
+        );
     }
 
-    public function overdue()
+    public function overdue(Request $request)
     {
         $user = auth('api')->user();
         $shopId = $user->shop_id ?? $user->branch->shop_id;
-        $query = Booking::with('items.item', 'customer')
-            ->where('return_date', '<', today()->toDateString())
-            ->where('status', 'PICKED_UP');
-        if ($user->branch_id) $query->where('branch_id', $user->branch_id);
-        else $query->where('shop_id', $shopId);
-        return response()->json($query->get());
+        $branchId = $request->branchId ?? $user->branch_id;
+        if (!$branchId) abort(422, 'A branch must be selected.');
+
+        return response()->json(
+            Booking::with('items.item', 'customer')
+                ->where('shop_id', $shopId)
+                ->where('branch_id', $branchId)
+                ->where('return_date', '<', today()->toDateString())
+                ->where('status', 'PICKED_UP')
+                ->get()
+        );
     }
 
     public function setUnavailable(Request $request)
@@ -659,8 +682,14 @@ class BookingController extends Controller
     public function downloadInvoicePdf($id, Request $request)
     {
         $booking = Booking::with('items.item', 'branch.shop', 'customer')->findOrFail($id);
-        $pdf = $this->pdfService->generateInvoice($booking, (bool)$request->withAck);
-        return $pdf->download("invoice-{$booking->invoice_number}.pdf");
+        $blob = $this->pdfService->generateInvoice($booking, (bool)$request->withAck);
+
+        return response($blob, 200, [
+            'Content-Type'        => 'application/pdf',
+            'Content-Disposition' => "attachment; filename=invoice-{$booking->invoice_number}.pdf",
+            'Cache-Control'       => 'private, max-age=3600',
+            'Content-Length'      => strlen($blob),
+        ]);
     }
 
     public function changeLogs($id)
@@ -694,7 +723,7 @@ class BookingController extends Controller
             'notes'               => 'nullable|string',
         ]);
 
-        $booking = $this->authorizedBooking((int) $id)->load('items');
+        $booking = $this->authorizedBooking((int) $id, true)->load('items');
         $user    = $changeUser;
 
         $existingPickup = $booking->booking_date instanceof \Carbon\Carbon
@@ -808,7 +837,7 @@ class BookingController extends Controller
 
     public function markItemReturned(Request $request, $itemId)
     {
-        $bi = $this->authorizedBookingItem((int) $itemId);
+        $bi = $this->authorizedBookingItem((int) $itemId, true);
         if (!in_array($bi->booking->status, ['PICKED_UP', 'RETURNED'])) {
             abort(400, 'Cannot mark an item as returned on a booking with status: ' . $bi->booking->status . '.');
         }
@@ -818,8 +847,14 @@ class BookingController extends Controller
 
     public function customerBookings(Request $request, $customerId)
     {
+        $user   = auth('api')->user();
+        $shopId = $user->shop_id ?? $user->branch->shop_id;
         return response()->json(
-            Booking::where('customer_id', $customerId)->with('items.item')->orderByDesc('id')->paginate($request->size ?? 20)
+            Booking::where('customer_id', $customerId)
+                ->where('shop_id', $shopId)
+                ->with('items.item', 'branch')
+                ->orderByDesc('id')
+                ->paginate($request->size ?? 20)
         );
     }
 

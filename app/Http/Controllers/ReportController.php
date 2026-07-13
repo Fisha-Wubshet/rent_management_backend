@@ -7,6 +7,7 @@ use App\Models\BookingItem;
 use App\Models\Branch;
 use App\Models\Item;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Carbon\Carbon;
 
 class ReportController extends Controller
@@ -152,24 +153,34 @@ class ReportController extends Controller
         $months   = (int) ($request->months ?? 6);
         $shopId   = $this->shopId();
         $branchId = $this->branchId($request);
-        $results  = [];
 
-        for ($i = $months - 1; $i >= 0; $i--) {
-            $date = Carbon::now()->subMonths($i);
-            $q    = $this->revenueQuery($shopId)
-                ->whereYear('booking_date', $date->year)
-                ->whereMonth('booking_date', $date->month)
-                ->where('branch_id', $branchId);
-            $bookings  = $q->get();
-            $results[] = [
-                'period'           => $date->format('Y-m'),
-                'label'            => $date->format('M Y'),
-                'totalRevenue'     => round($bookings->sum(fn($b) => $this->revenueFor($b)), 2),
-                'totalCollected'   => round($bookings->sum(fn($b) => $this->collectedFor($b)), 2),
-                'totalOutstanding' => round($bookings->sum(fn($b) => $this->outstandingFor($b)), 2),
-                'totalBookings'    => $bookings->where('status', '!=', 'CANCELLED')->count(),
-            ];
-        }
+        $key = "rpt:trend:{$shopId}:{$branchId}:{$months}";
+        $results = Cache::remember($key, 300, function () use ($months, $shopId, $branchId) {
+            $endDate   = Carbon::now()->endOfMonth()->toDateString();
+            $startDate = Carbon::now()->subMonths($months - 1)->startOfMonth()->toDateString();
+
+            $bookings = $this->revenueQuery($shopId)
+                ->where('branch_id', $branchId)
+                ->whereBetween('booking_date', [$startDate, $endDate])
+                ->get();
+
+            $grouped = $bookings->groupBy(fn($b) => Carbon::parse($b->booking_date)->format('Y-m'));
+
+            $out = [];
+            for ($i = $months - 1; $i >= 0; $i--) {
+                $date = Carbon::now()->subMonths($i);
+                $mb   = $grouped->get($date->format('Y-m'), collect());
+                $out[] = [
+                    'period'           => $date->format('Y-m'),
+                    'label'            => $date->format('M Y'),
+                    'totalRevenue'     => round($mb->sum(fn($b) => $this->revenueFor($b)), 2),
+                    'totalCollected'   => round($mb->sum(fn($b) => $this->collectedFor($b)), 2),
+                    'totalOutstanding' => round($mb->sum(fn($b) => $this->outstandingFor($b)), 2),
+                    'totalBookings'    => $mb->where('status', '!=', 'CANCELLED')->count(),
+                ];
+            }
+            return $out;
+        });
 
         return response()->json($results);
     }
@@ -180,26 +191,37 @@ class ReportController extends Controller
     {
         $shopId   = $this->shopId();
         $branchId = $this->branchId($request);
-        $items    = Item::whereHas('branch', fn($q) => $q->where('shop_id', $shopId))
-            ->where('branch_id', $branchId)
-            ->get();
 
-        $result = $items->map(function ($item) {
-            $bookingItems = BookingItem::where('item_id', $item->id)
+        $key = "rpt:byitem:{$shopId}:{$branchId}";
+        $result = Cache::remember($key, 300, function () use ($shopId, $branchId) {
+            $items = Item::where('branch_id', $branchId)
+                ->whereHas('branch', fn($q) => $q->where('shop_id', $shopId))
+                ->get(['id', 'unique_code', 'name']);
+
+            if ($items->isEmpty()) return [];
+
+            $itemIds = $items->pluck('id');
+
+            $bookingItems = BookingItem::whereIn('item_id', $itemIds)
                 ->whereHas('booking', function ($q) {
                     $q->where('status', '!=', 'CANCELLED')
                       ->orWhere(fn($q2) => $q2->where('status', 'CANCELLED')
                           ->whereRaw('total_advance_payment > COALESCE(refund_amount, 0)'));
                 })
-                ->with('booking')
-                ->get();
+                ->with('booking:id,status,total_agreed_price,total_advance_payment,refund_amount')
+                ->get(['id', 'item_id', 'booking_id']);
 
-            return [
-                'uniqueCode'    => $item->unique_code,
-                'itemName'      => $item->name,
-                'totalBookings' => $bookingItems->filter(fn($bi) => $bi->booking->status !== 'CANCELLED')->count(),
-                'totalRevenue'  => round($bookingItems->sum(fn($bi) => $this->revenueFor($bi->booking)), 2),
-            ];
+            $byItem = $bookingItems->groupBy('item_id');
+
+            return $items->map(function ($item) use ($byItem) {
+                $bis = $byItem->get($item->id, collect());
+                return [
+                    'uniqueCode'    => $item->unique_code,
+                    'itemName'      => $item->name,
+                    'totalBookings' => $bis->filter(fn($bi) => $bi->booking && $bi->booking->status !== 'CANCELLED')->count(),
+                    'totalRevenue'  => round($bis->sum(fn($bi) => $bi->booking ? $this->revenueFor($bi->booking) : 0), 2),
+                ];
+            })->values()->all();
         });
 
         return response()->json($result);

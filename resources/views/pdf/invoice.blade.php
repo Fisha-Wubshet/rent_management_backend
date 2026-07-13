@@ -5,7 +5,7 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-    font-family: DejaVu Sans, sans-serif;
+    font-family: Helvetica, Arial, sans-serif;
     font-size: 11px;
     color: #212121;
     background: #ffffff;
