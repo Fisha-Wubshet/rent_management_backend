@@ -25,3 +25,8 @@ _ide_helper.php
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Vue frontend build artifacts (rsynced to prod separately, not part of this repo)
+/public/assets/
+/public/index.html
+/public/vite.svg

@@ -101,7 +101,7 @@ class BookingController extends Controller
 
         $shopId   = $user->shop_id ?? $user->branch->shop_id;
         $branchId = (int) ($request->branchId ?? $user->branch_id ?? $user->branch?->id);
-        $booking  = $this->bookingService->createInvoice($data, $shopId, $branchId, $user->email);
+        $booking  = $this->bookingService->createInvoice($data, $shopId, $branchId, $user->email ?? $user->phone_number, $user->id);
 
         if (($data['totalAdvancePayment'] ?? 0) > 0) {
             $this->logPayment($booking, 'ADVANCE', (float) $data['totalAdvancePayment']);
@@ -123,6 +123,7 @@ class BookingController extends Controller
 
         if ($user->branch_id) $query->where('branch_id', $user->branch_id);
         if ($request->branchId) $query->where('branch_id', $request->branchId);
+        if ($request->createdById) $query->where('created_by_id', (int) $request->createdById);
         if ($request->status) $query->where('status', $request->status);
         if ($request->startDate)     $query->where('booking_date', '>=', $request->startDate);
         if ($request->endDate)       $query->where('booking_date', '<=', $request->endDate);

@@ -8,9 +8,14 @@ use App\Models\User;
 use App\Models\Subscription;
 use App\Models\Booking;
 use App\Models\Customer;
+use App\Support\PhoneNumber;
+use App\Support\RecoveryCode;
+use App\Mail\WelcomeCredentialsMail;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Log;
 
 class SuperAdminController extends Controller
 {
@@ -18,22 +23,69 @@ class SuperAdminController extends Controller
     {
         $data = $request->validate([
             'shopName' => 'required|string', 'shopAddress' => 'nullable|string',
-            'itemLabel' => 'nullable|string', 'email' => 'required|email|unique:users',
+            'itemLabel' => 'nullable|string',
+            'phone' => 'required|string', 'countryCode' => 'nullable|string',
+            'email' => 'nullable|email',
             'password' => 'required|min:6', 'firstName' => 'required|string', 'lastName' => 'required|string',
             'firstBranchName' => 'required|string', 'firstBranchAddress' => 'nullable|string',
             'durationDays' => 'required|integer', 'maxBranches' => 'nullable|integer',
             'isTrial' => 'nullable|boolean', 'amountPaid' => 'nullable|numeric',
             'planName' => 'nullable|string', 'subscriptionNotes' => 'nullable|string',
+            'emailLanguage' => 'nullable|in:en,am',
         ]);
 
-        return DB::transaction(function () use ($data) {
+        $countryCode = $data['countryCode'] ?? '+251';
+        $phone = PhoneNumber::normalize($data['phone'], $countryCode);
+        if (!PhoneNumber::isValid($phone)) abort(422, 'Invalid phone number.');
+        if (User::where('phone_number', $phone)->exists()) {
+            abort(422, 'A user with this phone number already exists.');
+        }
+
+        $plainRecoveryCode = RecoveryCode::generate();
+        $plainPassword     = $data['password'];
+        $emailLang         = $data['emailLanguage'] ?? 'en';
+
+        return DB::transaction(function () use ($data, $phone, $countryCode, $plainRecoveryCode, $plainPassword, $emailLang) {
             $shop = Shop::create(['name' => $data['shopName'], 'address' => $data['shopAddress'] ?? null, 'item_label' => $data['itemLabel'] ?? 'Dress']);
             $branch = Branch::create(['name' => $data['firstBranchName'], 'address' => $data['firstBranchAddress'] ?? null, 'shop_id' => $shop->id]);
-            $user = User::create(['first_name' => $data['firstName'], 'last_name' => $data['lastName'], 'email' => $data['email'], 'password' => Hash::make($data['password']), 'shop_id' => $shop->id]);
+            $user = User::create([
+                'first_name'           => $data['firstName'],
+                'last_name'            => $data['lastName'],
+                'email'                => $data['email'] ?? null,
+                'phone_number'         => $phone,
+                'country_code'         => $countryCode,
+                'password'             => Hash::make($plainPassword),
+                'recovery_code_hash'   => Hash::make($plainRecoveryCode),
+                'must_change_password' => true,
+                'shop_id'              => $shop->id,
+            ]);
             $user->assignRole('ROLE_SHOP_ADMIN');
             $start = now();
             Subscription::create(['shop_id' => $shop->id, 'plan_name' => $data['planName'] ?? 'Basic', 'amount_paid' => $data['amountPaid'] ?? 0, 'start_date' => $start, 'end_date' => $start->copy()->addDays($data['durationDays']), 'max_branches' => $data['maxBranches'] ?? 1, 'is_trial' => $data['isTrial'] ?? false, 'notes' => $data['subscriptionNotes'] ?? null]);
-            return response()->json(['shop' => $shop, 'branch' => $branch, 'user' => $user], 201);
+
+            // Fire-and-forget welcome email — dispatched to run AFTER the HTTP
+            // response is flushed, so the caller never waits on SMTP and any
+            // send failure is logged, not returned to the client.
+            $hasEmail = !empty($user->email);
+            if ($hasEmail) {
+                $email = $user->email;
+                dispatch(function () use ($user, $email, $plainPassword, $plainRecoveryCode, $emailLang) {
+                    try {
+                        Mail::to($email)->send(new WelcomeCredentialsMail($user, $plainPassword, $plainRecoveryCode, $emailLang));
+                    } catch (\Throwable $e) {
+                        Log::warning('welcome-credentials email failed for ' . $email . ': ' . $e->getMessage());
+                    }
+                })->afterResponse();
+            }
+
+            return response()->json([
+                'shop' => $shop,
+                'branch' => $branch,
+                'user' => $user,
+                'recoveryCode' => $plainRecoveryCode,
+                'plainPassword' => $plainPassword,
+                'emailQueued' => $hasEmail,
+            ], 201);
         });
     }
 

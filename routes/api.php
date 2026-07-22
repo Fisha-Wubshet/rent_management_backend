@@ -2,6 +2,8 @@
 
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\PasswordResetController;
+use App\Http\Controllers\PendingRegistrationController;
 use App\Http\Controllers\BookingController;
 use App\Http\Controllers\CustomerController;
 use App\Http\Controllers\ItemController;
@@ -23,16 +25,29 @@ use App\Http\Controllers\PaymentController;
 // --- Public ---
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/auth/refresh-token', [AuthController::class, 'refreshToken']);
+Route::post('/auth/forgot-password/recovery-code', [PasswordResetController::class, 'resetWithRecoveryCode']);
+Route::post('/auth/forgot-password/email-otp/request', [PasswordResetController::class, 'requestEmailOtp']);
+Route::post('/auth/forgot-password/email-otp/verify', [PasswordResetController::class, 'verifyEmailOtp']);
+
+// Self-serve registration (rate-limited: 5 attempts per IP per hour)
+Route::middleware('throttle:5,60')->group(function () {
+    Route::post('/register-request', [PendingRegistrationController::class, 'submit']);
+    Route::post('/register-request/confirm/{token}', [PendingRegistrationController::class, 'confirm']);
+});
 
 // --- Authenticated ---
 Route::middleware('jwt.auth')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/me', [AuthController::class, 'me']);
+    Route::post('/auth/recovery-code/regenerate', [PasswordResetController::class, 'regenerateRecoveryCode']);
+    Route::post('/auth/first-login/change-password', [AuthController::class, 'firstLoginChangePassword']);
 
     // Shop-admin: staff management (no /api prefix in Vue calls)
     Route::middleware('role:ROLE_SHOP_ADMIN')->group(function () {
         Route::post('/register-admin', [AuthController::class, 'registerAdmin']);
         Route::get('/shop/staff', [AuthController::class, 'listStaff']);
+        Route::get('/shop/staff/{id}', [AuthController::class, 'showStaff']);
+        Route::put('/shop/staff/{id}', [AuthController::class, 'updateStaff']);
         Route::put('/shop/staff/{id}/ban', [AuthController::class, 'banStaff']);
         Route::put('/shop/staff/{id}/unban', [AuthController::class, 'unbanStaff']);
         Route::put('/shop/staff/{id}/reset-password', [AuthController::class, 'resetStaffPassword']);
@@ -80,6 +95,13 @@ Route::middleware('jwt.auth')->group(function () {
             Route::put('/subscriptions/{id}/suspend', [SubscriptionController::class, 'suspend']);
             Route::put('/subscriptions/{id}/unsuspend', [SubscriptionController::class, 'unsuspend']);
             Route::post('/register', [AuthController::class, 'registerAdmin']);
+
+            // Self-serve registration queue
+            Route::get('/registration-requests',                  [PendingRegistrationController::class, 'index']);
+            Route::get('/registration-requests/counts',           [PendingRegistrationController::class, 'counts']);
+            Route::post('/registration-requests/{id}/approve',    [PendingRegistrationController::class, 'approve']);
+            Route::post('/registration-requests/{id}/reject',     [PendingRegistrationController::class, 'reject']);
+            Route::delete('/registration-requests/{id}',          [PendingRegistrationController::class, 'destroy']);
         });
 
         // All authenticated users — Bookings

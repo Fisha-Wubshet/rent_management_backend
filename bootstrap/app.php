@@ -1,5 +1,6 @@
 <?php
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -19,6 +20,20 @@ return Application::configure(basePath: dirname(__DIR__))
                 ->group(base_path('routes/web.php'));
         },
     )
+    ->withSchedule(function (Schedule $schedule): void {
+        // Prune operational audit rows older than 90 days, every night at 02:00 UTC.
+        // Critical actions (payments, deletions, security events) are never touched.
+        $schedule->command('audit:prune')
+            ->dailyAt('02:00')
+            ->withoutOverlapping()
+            ->onOneServer();
+
+        // Prune stale pending registrations nightly at 02:15 UTC.
+        $schedule->command('registrations:prune')
+            ->dailyAt('02:15')
+            ->withoutOverlapping()
+            ->onOneServer();
+    })
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
             'jwt.auth' => \App\Http\Middleware\JwtMiddleware::class,

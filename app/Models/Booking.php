@@ -12,7 +12,7 @@ class Booking extends Model
         'total_agreed_price', 'total_advance_payment', 'security_deposit',
         'security_deposit_returned', 'deposit_deduction', 'deposit_deduction_reason',
         'excess_damage_charge', 'refund_amount', 'cancellation_reason', 'cancelled_at',
-        'shop_id', 'branch_id'
+        'shop_id', 'branch_id', 'created_by_id',
     ];
     protected $casts = [
         'booking_date' => 'date', 'return_date' => 'date', 'cancelled_at' => 'datetime',
@@ -34,4 +34,5 @@ class Booking extends Model
     public function customer() { return $this->belongsTo(Customer::class); }
     public function items() { return $this->hasMany(BookingItem::class); }
     public function changeLogs() { return $this->hasMany(BookingChangeLog::class); }
+    public function createdBy() { return $this->belongsTo(User::class, 'created_by_id'); }
 }

@@ -100,9 +100,9 @@ class BookingService
         }
     }
 
-    public function createInvoice(array $data, int $shopId, int $branchId, string $performedBy): Booking
+    public function createInvoice(array $data, int $shopId, int $branchId, string $performedBy, ?int $createdById = null): Booking
     {
-        return DB::transaction(function () use ($data, $shopId, $branchId, $performedBy) {
+        return DB::transaction(function () use ($data, $shopId, $branchId, $performedBy, $createdById) {
             // Lock all requested items for the duration of this transaction to prevent double-booking.
             $itemIds = array_unique(array_column($data['items'], 'itemId'));
             Item::whereIn('id', $itemIds)->lockForUpdate()->get();
@@ -142,6 +142,7 @@ class BookingService
                 'security_deposit' => $data['securityDeposit'] ?? 0,
                 'shop_id' => $shopId,
                 'branch_id' => $branchId,
+                'created_by_id' => $createdById,
             ]);
 
             foreach ($data['items'] as $item) {
